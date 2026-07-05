@@ -23,6 +23,7 @@ Both methods reduce to a 1-D linear regression on K, so we share the same fit st
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -170,6 +171,15 @@ BD_METRIC_NAMES: tuple[str, ...] = (
     "undershoot",
     "tail_area",
     "settling_time",
+    # Per-segment estimate of the OPTIMAL K, from first-order theory:
+    # the fall response to a velocity step with mistuned PA is an
+    # exponential with residual time constant τ_res ≈ (K_true − K_set),
+    # and its signed area over the fall window is amplitude · τ_res.
+    # So K_true ≈ K_set + fall_signed_area / (fast−slow plateau delta).
+    # Every segment at every K yields an independent estimate of the
+    # answer; the sweep-wide median (bd_k_from_segments) uses ALL the
+    # data instead of only the neighbourhood of a zero crossing.
+    "k_estimate",
 )
 
 # Default weights for the composite cost. Each metric is normalised to
@@ -330,6 +340,16 @@ class SweepAnalysis:
     # two (no rise-transient bias); see the per-segment metric notes.
     bd_signed_rise_fit: FitResult | None = None
     bd_signed_fall_fit: FitResult | None = None
+    # Sweep-wide median of the per-segment k_estimate metric (see
+    # BD_METRIC_NAMES): every included segment independently estimates
+    # K_true = K_set + fall_signed_area / amplitude, so this estimator
+    # uses ALL the data rather than only the zero-crossing
+    # neighbourhood. `_mad` is the 1.4826-scaled median absolute
+    # deviation (σ-equivalent) across those estimates; `_n` is how many
+    # segments contributed.
+    bd_k_from_segments: float | None = None
+    bd_k_from_segments_mad: float | None = None
+    bd_k_from_segments_n: int = 0
     bd_default_weights: dict[str, float] = field(
         default_factory=lambda: dict(BD_DEFAULT_WEIGHTS)
     )
@@ -1233,19 +1253,22 @@ def _bd_segment_metrics(
                 abs(slope) * (plateau_t[-1] - plateau_t[0])
             )
 
-    # R3 overshoot: peak_value − high_level − noise floor. Reported as
-    # max(0, …) so the metric stays non-negative.
+    # R3 overshoot: peak_value − high_level − E[max of noise], UNCLAMPED.
     #
-    # The naive `peak − high_level` overcounts: even with no real
-    # overshoot, plateau noise produces samples a few σ above the
-    # plateau median. The argmax then reports those noise excursions as
-    # "overshoot" with values comparable to genuine PA-induced peaks.
-    # User report (run_1779125302, K=0..0.05): segments with NO visible
-    # transient still showed 80-180 raw-unit "overshoot" because the
-    # plateau noise std was ~60 raw units and the argmax found a 3σ
-    # excursion. Subtracting a 2σ plateau-noise floor lets noise-only
-    # peaks fall to 0 while genuine overshoots (200-1000 raw units on
-    # high-K segments where PA over-fires) survive cleanly.
+    # Two failure modes to avoid, from opposite directions:
+    #   * Plateau noise gives argmax a positive bias — a noise-only
+    #     segment reports a "peak" of E[max of n samples] ≈ σ·√(2·ln n)
+    #     above the plateau (user report run_1779125302: 80-180 raw
+    #     units of phantom overshoot). Subtracting that EXPECTED bias
+    #     centres noise-only segments near 0.
+    #   * The earlier max(0, … − 2σ) clamp CENSORED the distribution:
+    #     near K_opt most segments clamp to exactly 0, the per-K median
+    #     of a clamped distribution is biased, and the cost valley gets
+    #     a flat, noise-positioned bottom right where the argmin needs
+    #     resolution. So the value stays signed — small negatives are
+    #     real information ("peak was below expectation"), and the cost
+    #     composition clips negatives (see _bd_compute_cost) so "no
+    #     spike" isn't rewarded below zero.
     if t_peak is not None and np.isfinite(high_level_tared):
         peak_value = float(y_tared[peak_idx_global])  # type: ignore[index]
         # Plateau noise: residual std around high_level over the
@@ -1255,13 +1278,10 @@ def _bd_segment_metrics(
         if n_plat >= 6:
             plateau_residual = y_tared[plateau_mask] - high_level_tared
             plateau_noise_std = float(np.std(plateau_residual))
-        # Use the LARGER of plateau and baseline noise (whichever is
-        # more pessimistic) so a quiet plateau doesn't let baseline
-        # transients leak through, and vice versa.
-        noise_floor = 2.0 * max(plateau_noise_std, baseline_noise_std)
-        metrics["overshoot"] = max(
-            0.0, peak_value - high_level_tared - noise_floor
-        )
+        sigma = max(plateau_noise_std, baseline_noise_std)
+        n_win = max(2, int(peak_mask.sum()))
+        noise_bias = sigma * math.sqrt(2.0 * math.log(n_win))
+        metrics["overshoot"] = peak_value - high_level_tared - noise_bias
 
     # R2 rising-edge metrics. rise_delay = time from t_rise to peak. The
     # rise_error_area integrates |target − force| from t_rise to end of
@@ -1346,12 +1366,28 @@ def _bd_segment_metrics(
         #     → NEGATIVE → over-PA (K too high)
         # This is the metric backing bd_signed_fall_fit's K_opt.
         metrics["fall_signed_area"] = float(np.trapezoid(fw_y, fw_t))
+        # k_estimate: first-order theory says the fall's signed area is
+        # amplitude · (K_true − K_set) — the exponential tail of a
+        # mistuned step integrates to amplitude · τ_residual, and the
+        # residual advance error IS K_true − K_set. Dividing by the
+        # measured leg amplitude turns every segment into an
+        # independent estimate of the optimal K:
+        #   drool tail (area > 0)  → K_true above this segment's K
+        #   undershoot (area < 0)  → K_true below it
+        if np.isfinite(high_level_tared) and high_level_tared > 0:
+            metrics["k_estimate"] = (
+                k + metrics["fall_signed_area"] / high_level_tared
+            )
 
     # R7 undershoot: how far the trough sits below the baseline (tared
-    # zero). max(0, …) so undershoot stays non-negative.
+    # zero), minus the expected argmin-noise bias. Signed and unclamped
+    # for the same censoring reason as overshoot above (the cost clips
+    # negatives; the metric doesn't).
     if t_trough is not None:
         trough_value = float(y_tared[trough_idx_global])  # type: ignore[index]
-        metrics["undershoot"] = max(0.0, -trough_value)
+        n_win = max(2, int(trough_mask.sum()))
+        noise_bias = baseline_noise_std * math.sqrt(2.0 * math.log(n_win))
+        metrics["undershoot"] = -trough_value - noise_bias
 
     # R8 recovery: integrate |force| over the recovery window. Starts
     # at t_fall_end (threshold-based, force back within 10% of plateau
@@ -1501,9 +1537,15 @@ def _bd_aggregate_per_k(
 def _bd_compute_normalised(per_k: list[BdKResult]) -> None:
     """In-place: fill `normalised` on each BdKResult.
 
-    For each metric, divide by the sweep-wide `max(|value|)` so the cost
-    composition is dimensionally consistent. If max is 0 or all NaN, the
-    metric normalises to NaN for every K.
+    For each metric, divide by a ROBUST sweep-wide scale — the 90th
+    percentile of |per-K medians| — so the cost composition is
+    dimensionally consistent. The previous scale (plain max) let a
+    single outlier K rescale the metric's entire contribution to the
+    composite cost, which also made optimiser-learned weights depend on
+    whichever run had the worst outlier. With the p90 scale, values may
+    slightly exceed ±1 (by design: outliers stick out instead of
+    compressing everything else). If the scale is 0 or all values NaN,
+    the metric normalises to NaN for every K.
     """
     if not per_k:
         return
@@ -1515,7 +1557,14 @@ def _bd_compute_normalised(per_k: list[BdKResult]) -> None:
         if len(finite_abs) == 0:
             denom = 0.0
         else:
-            denom = float(finite_abs.max())
+            p90 = float(np.percentile(finite_abs, 90))
+            mx = float(finite_abs.max())
+            # Sparse-signal guard: when a metric is ~zero at most Ks
+            # (e.g. fall_delay on a snappy response), p90 collapses to
+            # ~0 and would blow the division up / NaN the whole cost.
+            # In that regime the robust scale carries no information --
+            # fall back to the max.
+            denom = p90 if p90 > 0.05 * mx else mx
         for r, v in zip(per_k, vals):
             if denom > 0 and np.isfinite(v):
                 r.normalised[name] = float(v / denom)
@@ -1619,6 +1668,89 @@ def _linear_fit_zero_crossing(
         intercept=float(intercept),
         r_squared=r2,
         method=method,
+    )
+
+
+def _signed_area_zero_crossing_fit(
+    k_values: np.ndarray,
+    y_values: np.ndarray,
+    method: str,
+    half_window: int = 5,
+) -> FitResult | None:
+    """Zero-crossing K_opt from a signed-area-vs-K curve, fitted LOCALLY
+    around the sign change with a Theil–Sen robust line.
+
+    Why not a global OLS fit: the signed-area response is only locally
+    linear around K_opt; the high-K tail saturates and is noisy, and a
+    global `polyfit` lets that tail drag the zero crossing around
+    (observed on real runs). The Snapmaker U1's production algorithm
+    mitigates the same problem by fitting only 4–5 points bracketing
+    the crossing inside a narrow K window — this is the grid-sweep
+    equivalent: find the (+ → −) sign change of the per-K medians and
+    fit only ±`half_window` grid points around it. Theil–Sen (median of
+    pairwise slopes) keeps a single bad K in the local window from
+    steering the fit the way OLS would.
+
+    Falls back to the global linear fit when no (+ → −) crossing exists
+    in the data (all-positive = sweep ended below K_opt; all-negative =
+    started above it) — extrapolation is then the only option and the
+    global trend is the best available.
+    """
+    mask = np.isfinite(y_values)
+    if mask.sum() < 3:
+        return _linear_fit_zero_crossing(k_values, y_values, method)
+    k = k_values[mask].astype(float)
+    y = y_values[mask].astype(float)
+
+    # Locate the (+ → −) crossing: signed areas run positive (under-PA)
+    # at low K and negative (over-PA) at high K. With noise there may
+    # be several sign flips; pick the one closest to the median K of
+    # ALL flips (robust to isolated noise flips at the tails).
+    flips = [
+        i for i in range(len(y) - 1)
+        if y[i] > 0 >= y[i + 1]
+    ]
+    if not flips:
+        return _linear_fit_zero_crossing(k_values, y_values, method)
+    mid_flip_k = float(np.median([k[i] for i in flips]))
+    cross = min(flips, key=lambda i: abs(k[i] - mid_flip_k))
+
+    lo = max(0, cross - half_window + 1)
+    hi = min(len(y), cross + 1 + half_window)
+    kw = k[lo:hi]
+    yw = y[lo:hi]
+    if len(kw) < 3:
+        return _linear_fit_zero_crossing(k_values, y_values, method)
+
+    # Theil–Sen: slope = median over all pairwise slopes, intercept =
+    # median residual.
+    slopes = [
+        (yw[j] - yw[i]) / (kw[j] - kw[i])
+        for i in range(len(kw))
+        for j in range(i + 1, len(kw))
+        if kw[j] != kw[i]
+    ]
+    if not slopes:
+        return _linear_fit_zero_crossing(k_values, y_values, method)
+    slope = float(np.median(slopes))
+    if slope == 0:
+        return _linear_fit_zero_crossing(k_values, y_values, method)
+    intercept = float(np.median(yw - slope * kw))
+    k_opt = -intercept / slope
+    # Clamp to the local window: the crossing is IN this window by
+    # construction, so a fit escaping it is noise-driven.
+    k_opt = float(min(max(k_opt, kw[0]), kw[-1]))
+    # R² of the robust line over the local window (display only).
+    y_pred = slope * kw + intercept
+    ss_res = float(np.sum((yw - y_pred) ** 2))
+    ss_tot = float(np.sum((yw - np.mean(yw)) ** 2))
+    r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 1.0
+    return FitResult(
+        k_opt=k_opt,
+        slope=slope,
+        intercept=intercept,
+        r_squared=r2,
+        method=f"{method}_theil_sen_local",
     )
 
 
@@ -3605,6 +3737,19 @@ def analyse_sweep(
                     fast_half_s=float(p.fast_half_s),
                     dropout_t=dropout_abs,
                 )
+                # First-cycle exclusion (Snapmaker U1's drop1=1): with
+                # zero inter-K dwell, cycle 0's slow leg IS the
+                # previous K's pressure relaxation, so its step
+                # response carries the neighbouring K's history — a
+                # bias that is directionally correlated with sweep
+                # order. Only applied when the K has enough cycles to
+                # spare (single-cycle-per-K sweeps keep everything).
+                if i == 0 and seg.cycles >= 3 and not bd_seg.excluded:
+                    bd_seg.excluded = True
+                    bd_seg.exclusion_reasons.append(
+                        "first cycle after K switch (carries previous "
+                        "K's pressure history)"
+                    )
                 bd_segs_this_k.append(bd_seg)
         bd_segments_by_k[seg.k] = bd_segs_this_k
         bd_segments.extend(bd_segs_this_k)
@@ -3865,12 +4010,45 @@ def analyse_sweep(
             [r.medians.get("fall_signed_area", float("nan")) for r in bd_per_k],
             dtype=float,
         )[bd_quality_mask]
-        bd_signed_rise_fit = _linear_fit_zero_crossing(
+        bd_signed_rise_fit = _signed_area_zero_crossing_fit(
             ks_signed, rise_signed, "signed_rise_area"
         )
-        bd_signed_fall_fit = _linear_fit_zero_crossing(
+        bd_signed_fall_fit = _signed_area_zero_crossing_fit(
             ks_signed, fall_signed, "signed_fall_area"
         )
+
+    # Per-segment K estimator: median of k_estimate over every included
+    # segment whose K passed the same quality gates as the other
+    # extractors. Robust (median + MAD) and uses the whole sweep.
+    bd_k_from_segments: float | None = None
+    bd_k_from_segments_mad: float | None = None
+    bd_k_from_segments_n = 0
+    if bd_quality_mask.any():
+        good_ks = {
+            r.k for i, r in enumerate(bd_per_k) if bd_quality_mask[i]
+        }
+        k_ests = np.asarray(
+            [
+                s.metrics.get("k_estimate", float("nan"))
+                for s in bd_segments
+                if not s.excluded and s.k in good_ks
+            ],
+            dtype=float,
+        )
+        k_ests = k_ests[np.isfinite(k_ests)]
+        if len(k_ests) >= 4:
+            bd_k_from_segments = float(np.median(k_ests))
+            bd_k_from_segments_mad = float(
+                1.4826 * np.median(np.abs(k_ests - bd_k_from_segments))
+            )
+            bd_k_from_segments_n = int(len(k_ests))
+            notes.append(
+                f"per-segment K estimator (fall area / amplitude, "
+                f"first-order theory): K_opt="
+                f"{bd_k_from_segments:.4f} ± "
+                f"{bd_k_from_segments_mad:.4f} (MAD) over "
+                f"{bd_k_from_segments_n} segments"
+            )
 
     if phase_fit is None:
         notes.append("Phase-lag fit failed — insufficient data or zero slope.")
@@ -3918,5 +4096,8 @@ def analyse_sweep(
         bd_k_opt=bd_k_opt,
         bd_signed_rise_fit=bd_signed_rise_fit,
         bd_signed_fall_fit=bd_signed_fall_fit,
+        bd_k_from_segments=bd_k_from_segments,
+        bd_k_from_segments_mad=bd_k_from_segments_mad,
+        bd_k_from_segments_n=bd_k_from_segments_n,
         bd_default_weights=dict(BD_DEFAULT_WEIGHTS),
     )

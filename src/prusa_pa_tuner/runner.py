@@ -217,6 +217,17 @@ def _analysis_to_dict(a: SweepAnalysis) -> dict[str, Any]:
         # rise_signed_area / fall_signed_area.
         "bd_signed_rise_fit": _fit_to_dict(a.bd_signed_rise_fit),
         "bd_signed_fall_fit": _fit_to_dict(a.bd_signed_fall_fit),
+        # Per-segment K estimator (fall_signed_area / amplitude, median
+        # over all included segments) -- see SweepAnalysis.
+        "bd_k_from_segments": (
+            _safe_float(a.bd_k_from_segments)
+            if a.bd_k_from_segments is not None else None
+        ),
+        "bd_k_from_segments_mad": (
+            _safe_float(a.bd_k_from_segments_mad)
+            if a.bd_k_from_segments_mad is not None else None
+        ),
+        "bd_k_from_segments_n": a.bd_k_from_segments_n,
         **_bd_weights_payload(a.bd_default_weights),
         "bd_per_k": [
             {

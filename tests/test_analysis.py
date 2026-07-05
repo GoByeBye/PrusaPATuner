@@ -2935,3 +2935,116 @@ def test_slice_from_plan_returns_warmup_aware_windows():
     assert windows[1] == (11.5, 14.5)
     # K[2]: start_offset=14.5, duration=3 → window [14.5, 17.5]
     assert windows[2] == (14.5, 17.5)
+
+
+def test_k_estimate_recovers_residual_time_constant():
+    """First-order theory: a fall transient decaying with residual time
+    constant tau_res integrates to amplitude * tau_res, so
+    k_estimate = K_set + fall_signed_area / amplitude must recover
+    K_true = K_set + tau_res. Synthesise exactly that physics and check
+    the segment metric lands on it."""
+    from prusa_pa_tuner.analysis import _bd_segment_metrics
+
+    k_set = 0.030
+    tau_res = 0.020          # residual advance error -> K_true = 0.050
+    amplitude = 1000.0
+    baseline = 200.0
+    slow, fast = 1.0, 0.25
+    fs = 500.0
+    t_start, t_rise, t_fall = 0.0, slow, slow + fast
+    t_end = slow + fast + slow
+    t = np.arange(t_start, t_end, 1.0 / fs)
+    y = np.full_like(t, baseline)
+    # Rise: instant step to the fast plateau (rise shape irrelevant here).
+    y[(t >= t_rise) & (t < t_fall)] = baseline + amplitude
+    # Fall: exponential decay from the plateau with tau_res -- the
+    # signature of under-compensated PA on the fall side.
+    fall_mask = t >= t_fall
+    y[fall_mask] = baseline + amplitude * np.exp(
+        -(t[fall_mask] - t_fall) / tau_res
+    )
+
+    seg = _bd_segment_metrics(
+        force_t=t, force_y=y,
+        k=k_set, seg_idx=1,
+        t_start=t_start, t_rise=t_rise, t_fall=t_fall, t_end=t_end,
+        slow_half_s=slow, fast_half_s=fast,
+        dropout_t=np.array([]),
+    )
+    k_est = seg.metrics.get("k_estimate", float("nan"))
+    assert np.isfinite(k_est), seg.metrics
+    # The detected fall_start sits slightly into the decay (the trace
+    # only leaves the 90% threshold a few ms after t_fall), which
+    # shaves a sliver off the integral -- allow a half-step tolerance.
+    assert abs(k_est - (k_set + tau_res)) < 0.005, (
+        f"k_estimate={k_est:.4f}, expected ~{k_set + tau_res:.4f} "
+        f"(fall_signed_area={seg.metrics.get('fall_signed_area'):.1f}, "
+        f"high_level={seg.metrics.get('high_level'):.1f})"
+    )
+
+
+def test_signed_area_local_fit_ignores_noisy_high_k_tail():
+    """The signed-area curve is only locally linear around K_opt; the
+    high-K tail saturates and is noisy. A global OLS fit gets dragged by
+    the tail; the local Theil-Sen fit must land on the true crossing."""
+    from prusa_pa_tuner.analysis import _signed_area_zero_crossing_fit
+
+    ks = np.arange(0.0, 0.102, 0.002)
+    true_k = 0.040
+    # Linear through the crossing, saturating + noisy past 0.07.
+    y = -20000.0 * (ks - true_k)
+    tail = ks > 0.07
+    rng = np.random.default_rng(7)
+    y[tail] = -600.0 + rng.normal(0, 400.0, int(tail.sum()))
+
+    fit = _signed_area_zero_crossing_fit(ks, y, "signed_fall_area")
+    assert fit is not None
+    assert fit.method.endswith("theil_sen_local")
+    assert abs(fit.k_opt - true_k) < 0.003, f"k_opt={fit.k_opt:.4f}"
+
+
+def test_signed_area_fit_falls_back_to_global_without_crossing():
+    """All-positive signed areas (sweep ended below K_opt) leave no
+    crossing to fit locally -- the estimator must fall back to the
+    global linear fit / extrapolation."""
+    from prusa_pa_tuner.analysis import _signed_area_zero_crossing_fit
+
+    ks = np.arange(0.0, 0.05, 0.005)
+    y = 1000.0 - 10000.0 * ks  # crosses zero at 0.10, outside the data
+    fit = _signed_area_zero_crossing_fit(ks, y, "signed_fall_area")
+    assert fit is not None
+    assert not fit.method.endswith("theil_sen_local")
+    assert abs(fit.k_opt - 0.10) < 0.005
+
+
+def test_overshoot_stays_unclamped_negative_when_peak_below_expectation():
+    """Regression against re-introducing the censoring clamp: a segment
+    whose peak sits BELOW plateau + expected-noise-max must report a
+    (small) negative overshoot, not exactly 0.0 -- the per-K median
+    needs the uncensored distribution to stay unbiased near K_opt."""
+    from prusa_pa_tuner.analysis import _bd_segment_metrics
+
+    slow, fast, fs = 1.0, 0.25, 500.0
+    t = np.arange(0.0, slow + fast + slow, 1.0 / fs)
+    y = np.full_like(t, 100.0)
+    # Perfectly flat plateau (no noise, no overshoot): the expected-max
+    # bias term is ~0 too, so construct a plateau whose peak region is
+    # slightly LOWER than the plateau median (a dip right after rise).
+    high = (t >= slow) & (t < slow + fast)
+    y[high] = 1100.0
+    dip = (t >= slow) & (t < slow + 0.02)
+    y[dip] = 1050.0
+    rng = np.random.default_rng(5)
+    y += rng.normal(0, 5.0, len(y))
+
+    seg = _bd_segment_metrics(
+        force_t=t, force_y=y,
+        k=0.02, seg_idx=1,
+        t_start=0.0, t_rise=slow, t_fall=slow + fast,
+        t_end=slow + fast + slow,
+        slow_half_s=slow, fast_half_s=fast,
+        dropout_t=np.array([]),
+    )
+    ov = seg.metrics.get("overshoot", float("nan"))
+    assert np.isfinite(ov)
+    assert ov < 0.0, f"expected negative (uncensored) overshoot, got {ov}"
