@@ -129,10 +129,10 @@ Buddy's metrics subsystem needs two things to stream:
 > **Metric activation is not persistent.** It resets on every power cycle. Re-enable the
 > four metrics at the start of each tuning session.
 
-After enabling, run `sniff.py` from the host to confirm packets are actually arriving:
+After enabling, run `scripts/sniff.py` from the host to confirm packets are actually arriving:
 
 ```powershell
-python sniff.py --prusalink-host <printer-IP> --password <PrusaLink-password> --log capture.log
+python scripts/sniff.py --prusalink-host <printer-IP> --password <PrusaLink-password> --log capture.log
 ```
 
 You should see `loadcell_hp`, `loadcell_value`, `loadcell_xy`, `loadcell_age` ticking
@@ -170,7 +170,7 @@ A browser opens at <http://127.0.0.1:8765/>.
 5. **Copy `M572 S…`** to paste into your slicer's filament profile.
 
 Raw run data is saved to `runs/run_<timestamp>.npz` (gitignored by default). Use
-`replay_run.py` to re-analyse old runs without re-printing.
+`scripts/replay_run.py` to re-analyse old runs without re-printing.
 
 ## Algorithm notes
 
@@ -218,18 +218,26 @@ src/prusa_pa_tuner/
   app.py            # FastAPI app + websocket runner
   config.py         # persistent user config (lives outside the repo)
   gcode_gen.py      # generates the K-sweep .gcode
+  gcode_preamble.py # shared printer preamble used by all four generators
   prusalink.py      # PrusaLink REST client (Digest + legacy X-Api-Key)
-  udp_metrics.py    # async UDP listener + line-protocol parser
-  analysis.py       # bd_pressure + phase-lag + U1 integral-area
-  runner.py         # end-to-end orchestration
+  udp_metrics.py    # async UDP listener + parser + firmware-clock mapper
+  analysis.py       # bd_pressure + phase-lag + U1 integral-area metrics
+  alignment.py      # sweep_t0 anchoring + per-K window slicing
+  runner.py         # end-to-end orchestration (PA sweep)
+  run_lifecycle.py  # shared runner machinery (poll loop, collectors, dumps)
+  sampling.py       # shared metric-sample extraction helpers
+  flow_*.py         # Max Flow module (gen/runner/analysis)
+  livemap_*.py      # Live Map module
+  probe_*.py        # Touch Probe module
   netutil.py        # detect local IP toward the printer
   replay.py         # offline replay of saved runs/*.npz
   static/           # web UI (vanilla HTML + Plotly + JS)
-sniff.py            # standalone UDP sniffer (go/no-go gate)
-replay_run.py       # CLI: replay a saved run through the analyser
-diagnose.py         # one-shot extrude + UDP capture for triage
-check_loadcell.py   # PrusaLink metric-availability probe
-examine_sg.py       # stationary-extrude force capture
+scripts/
+  sniff.py          # standalone UDP sniffer (go/no-go gate)
+  replay_run.py     # CLI: replay a saved run through the analyser
+  diagnose.py       # one-shot extrude + UDP capture for triage
+  check_loadcell.py # PrusaLink metric-availability probe
+  examine_sg.py     # stationary-extrude force capture
 tests/              # pytest
 ```
 

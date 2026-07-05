@@ -20,9 +20,9 @@ from pathlib import Path
 
 import numpy as np
 
-# Allow running this script from the repo root without installing the
-# package — append `src/` to sys.path so `prusa_pa_tuner` resolves.
-SRC = Path(__file__).parent / "src"
+# Allow running this script without installing the package — the repo's
+# `src/` sits one level above this scripts/ directory.
+SRC = Path(__file__).resolve().parent.parent / "src"
 if SRC.exists() and str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
