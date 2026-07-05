@@ -16,6 +16,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable
 
@@ -27,7 +28,16 @@ from .livemap_gen import build_livemap_gcode
 from .livemap_map import MappedRun, map_run
 from .netutil import local_ip_toward
 from .prusalink import PrusaLinkClient
-from .runner import _extract_force, _extract_numeric, _sort_by_time
+from .run_lifecycle import (
+    anchor_fields,
+    cancel_collectors,
+    collect_metric,
+    npz_scalar,
+    poll_job_until_done,
+    runs_dir,
+    schedule_on_update,
+)
+from .sampling import extract_force, extract_numeric, sort_by_time
 from .udp_metrics import MetricStream
 
 log = logging.getLogger(__name__)
@@ -61,17 +71,7 @@ class LiveMapRun:
     on_update: Callable[["LiveMapRun"], None] | None = None
 
     def emit(self) -> None:
-        if self.on_update is None:
-            return
-        try:
-            result = self.on_update(self)
-            if asyncio.iscoroutine(result):
-                try:
-                    asyncio.get_running_loop().create_task(result)
-                except RuntimeError:
-                    result.close()
-        except Exception:
-            log.exception("livemap on_update callback failed")
+        schedule_on_update(self.on_update, self, log, "livemap on_update callback failed")
 
     def to_dict(self) -> dict[str, Any]:
         s = self.state
@@ -125,31 +125,23 @@ async def run_live_map(
 
     stop_collect = asyncio.Event()
 
-    async def collect_force() -> None:
-        async for sample in stream.subscribe(loadcell_metric):
-            if stop_collect.is_set():
-                return
-            v = _extract_force(sample)
-            if v is None:
-                continue
-            run.force_t.append(sample.recv_monotonic)
-            run.force_y.append(v)
-
-    async def collect_pos(metric: str, t_list: list[float], y_list: list[float]) -> None:
-        async for sample in stream.subscribe(metric):
-            if stop_collect.is_set():
-                return
-            v = _extract_numeric(sample)
-            if v is None:
-                continue
-            t_list.append(sample.recv_monotonic)
-            y_list.append(v)
-
     collectors = [
-        asyncio.create_task(collect_force()),
-        asyncio.create_task(collect_pos("pos_x", run.pos_x_t, run.pos_x)),
-        asyncio.create_task(collect_pos("pos_y", run.pos_y_t, run.pos_y)),
-        asyncio.create_task(collect_pos("pos_z", run.pos_z_t, run.pos_z)),
+        asyncio.create_task(collect_metric(
+            stream, loadcell_metric, stop_collect, extract_force,
+            run.force_t, run.force_y,
+        )),
+        asyncio.create_task(collect_metric(
+            stream, "pos_x", stop_collect, extract_numeric,
+            run.pos_x_t, run.pos_x,
+        )),
+        asyncio.create_task(collect_metric(
+            stream, "pos_y", stop_collect, extract_numeric,
+            run.pos_y_t, run.pos_y,
+        )),
+        asyncio.create_task(collect_metric(
+            stream, "pos_z", stop_collect, extract_numeric,
+            run.pos_z_t, run.pos_z,
+        )),
     ]
 
     try:
@@ -163,22 +155,15 @@ async def run_live_map(
             run.state.message = "Printing; mapping nozzle force live…"
             run.emit()
 
-            import httpx
-            transient = (
-                httpx.ReadError, httpx.ReadTimeout, httpx.ConnectError,
-                httpx.ConnectTimeout, httpx.RemoteProtocolError,
-            )
-            t_start = time.monotonic()
-            last_progress = -1.0
-            last_status_state: str | None = None
-            consecutive_failures = 0
             warned_no_pos = False
-            while True:
+
+            def warn_if_no_pos(elapsed_s: float) -> None:
                 # Fail-fast: if force is streaming but position isn't, the map
                 # will be empty (e.g. the wrong metric -- 'ipos' instead of
                 # 'pos' -- was enabled). Warn within ~20 s rather than after the
                 # whole print.
-                if (not warned_no_pos and time.monotonic() - t_start > 20.0
+                nonlocal warned_no_pos
+                if (not warned_no_pos and elapsed_s > 20.0
                         and len(run.force_t) > 50 and len(run.pos_x) == 0):
                     warned_no_pos = True
                     run.state.message = (
@@ -190,57 +175,20 @@ async def run_live_map(
                     log.warning(
                         "livemap: %d force samples but 0 pos_x after %ds -- "
                         "position metrics not streaming; map will be empty",
-                        len(run.force_t), int(time.monotonic() - t_start),
+                        len(run.force_t), int(elapsed_s),
                     )
-                if time.monotonic() - t_start > job_timeout_s:
-                    try:
-                        final_status = await pl.get_job_status()
-                    except transient:
-                        final_status = None
-                    final_state = (
-                        final_status.state.upper() if final_status is not None
-                        else (last_status_state or "")
-                    )
-                    if final_state in ("FINISHED", "STOPPED", "CANCELLED", "IDLE", ""):
-                        log.warning(
-                            "livemap job_timeout reached but final status %r -- "
-                            "treating as done", final_state,
-                        )
-                        break
-                    raise TimeoutError(
-                        f"job exceeded timeout ({job_timeout_s:.0f}s); "
-                        f"last known state: {final_state}"
-                    )
-                try:
-                    status = await pl.get_job_status()
-                    consecutive_failures = 0
-                except transient as exc:
-                    consecutive_failures += 1
-                    if consecutive_failures >= 10:
-                        raise RuntimeError(
-                            f"PrusaLink unresponsive after {consecutive_failures} "
-                            f"failures: {type(exc).__name__}: {exc}"
-                        )
-                    run.state.message = (
-                        f"Printing… (PrusaLink busy, retrying "
-                        f"{consecutive_failures}/10)"
-                    )
-                    run.emit()
-                    await asyncio.sleep(poll_interval_s)
-                    continue
-                if status is None:
-                    break
-                last_status_state = status.state.upper()
-                if last_status_state in ("FINISHED", "STOPPED", "CANCELLED", "IDLE"):
-                    break
-                if last_status_state in ("ERROR",):
-                    raise RuntimeError(f"printer reported ERROR: {status.raw}")
-                if status.progress_pct != last_progress:
-                    run.state.progress_pct = status.progress_pct
-                    run.state.message = f"Printing… {status.progress_pct:.0f}%"
-                    run.emit()
-                    last_progress = status.progress_pct
-                await asyncio.sleep(poll_interval_s)
+
+            await poll_job_until_done(
+                pl, run,
+                job_timeout_s=job_timeout_s,
+                poll_interval_s=poll_interval_s,
+                verb="Printing",
+                log_timeout_done=lambda final_state: log.warning(
+                    "livemap job_timeout reached but final status %r -- "
+                    "treating as done", final_state,
+                ),
+                on_tick=warn_if_no_pos,
+            )
 
         run.state.state = "saving"
         run.state.message = "Saving captured data…"
@@ -260,12 +208,7 @@ async def run_live_map(
         run.emit()
     finally:
         stop_collect.set()
-        for task in collectors:
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
+        await cancel_collectors(collectors, log)
         log.info(
             "livemap captured: %d force, %d pos_x, %d pos_y, %d pos_z samples",
             len(run.force_t), len(run.pos_x), len(run.pos_y), len(run.pos_z),
@@ -281,23 +224,21 @@ def _dump_livemap_run(run: LiveMapRun) -> str | None:
     embedded gcode can be large; np.load reads it back transparently.
     """
     try:
-        runs_dir = Path("runs")
-        runs_dir.mkdir(exist_ok=True)
         fname = f"livemap_{int(run.state.started_at)}.npz"
-        dump_path = runs_dir / fname
+        dump_path = runs_dir() / fname
 
         force_t = np.asarray(run.force_t, dtype=float)
         force_y = np.asarray(run.force_y, dtype=float)
-        force_t, force_y = _sort_by_time(force_t, force_y)
+        force_t, force_y = sort_by_time(force_t, force_y)
         px_t = np.asarray(run.pos_x_t, dtype=float)
         px = np.asarray(run.pos_x, dtype=float)
-        px_t, px = _sort_by_time(px_t, px)
+        px_t, px = sort_by_time(px_t, px)
         py_t = np.asarray(run.pos_y_t, dtype=float)
         py = np.asarray(run.pos_y, dtype=float)
-        py_t, py = _sort_by_time(py_t, py)
+        py_t, py = sort_by_time(py_t, py)
         pz_t = np.asarray(run.pos_z_t, dtype=float)
         pz = np.asarray(run.pos_z, dtype=float)
-        pz_t, pz = _sort_by_time(pz_t, pz)
+        pz_t, pz = sort_by_time(pz_t, pz)
 
         gcode_bytes = np.frombuffer(run.user_gcode.encode("utf-8"), dtype=np.uint8)
         np.savez_compressed(
@@ -306,8 +247,7 @@ def _dump_livemap_run(run: LiveMapRun) -> str | None:
             pos_x_t=px_t, pos_x=px,
             pos_y_t=py_t, pos_y=py,
             pos_z_t=pz_t, pos_z=pz,
-            mono_anchor_mono=np.array([float(time.monotonic())]),
-            mono_anchor_unix=np.array([float(time.time())]),
+            **anchor_fields(),
             started_at_unix=np.array([float(run.state.started_at)]),
             gcode_bytes=gcode_bytes,
             gcode_name=np.array([run.name], dtype="U256"),
@@ -352,10 +292,7 @@ def list_livemap_runs(runs_dir: str | os.PathLike = "runs") -> list[LiveMapRunIn
         try:
             with np.load(f, allow_pickle=True) as d:
                 ft = d["force_t"] if "force_t" in d else np.array([])
-
-                def _s(key: str, default: float) -> float:
-                    return float(d[key][0]) if key in d and len(d[key]) else default
-
+                _s = partial(npz_scalar, d)
                 name = ""
                 if "gcode_name" in d and len(d["gcode_name"]):
                     try:

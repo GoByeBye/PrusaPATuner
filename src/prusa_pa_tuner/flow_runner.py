@@ -12,6 +12,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable
 
@@ -22,7 +23,16 @@ from .flow_analysis import FlowAnalysis, analyse_flow, flow_analysis_to_dict
 from .flow_gen import FlowPlan, FlowRampParams, build_flow_ramp
 from .netutil import local_ip_toward
 from .prusalink import PrusaLinkClient
-from .runner import _extract_force, _extract_numeric, _sort_by_time
+from .run_lifecycle import (
+    anchor_fields,
+    cancel_collectors,
+    collect_metric,
+    npz_scalar,
+    poll_job_until_done,
+    runs_dir,
+    schedule_on_update,
+)
+from .sampling import extract_force, extract_numeric, sort_by_time
 from .udp_metrics import MetricStream
 
 log = logging.getLogger(__name__)
@@ -51,17 +61,7 @@ class FlowRun:
     on_update: Callable[["FlowRun"], None] | None = None
 
     def emit(self) -> None:
-        if self.on_update is None:
-            return
-        try:
-            result = self.on_update(self)
-            if asyncio.iscoroutine(result):
-                try:
-                    asyncio.get_running_loop().create_task(result)
-                except RuntimeError:
-                    result.close()
-        except Exception:
-            log.exception("flow on_update callback failed")
+        schedule_on_update(self.on_update, self, log, "flow on_update callback failed")
 
     def to_dict(self) -> dict[str, Any]:
         s = self.state
@@ -133,30 +133,18 @@ async def run_flow_test(
 
     stop_collect = asyncio.Event()
 
-    async def collect_loadcell() -> None:
-        async for sample in stream.subscribe(loadcell_metric):
-            if stop_collect.is_set():
-                return
-            v = _extract_force(sample)
-            if v is None:
-                continue
-            run.force_t.append(sample.recv_monotonic)
-            run.force_y.append(v)
-            if run.state.sweep_t0 is None and run.state.state == "running":
-                run.state.sweep_t0 = sample.recv_monotonic
+    def latch_sweep_t0(sample, v) -> None:
+        if run.state.sweep_t0 is None and run.state.state == "running":
+            run.state.sweep_t0 = sample.recv_monotonic
 
-    async def collect_pos_z() -> None:
-        async for sample in stream.subscribe("pos_z"):
-            if stop_collect.is_set():
-                return
-            v = _extract_numeric(sample)
-            if v is None:
-                continue
-            run.pos_z_t.append(sample.recv_monotonic)
-            run.pos_z.append(v)
-
-    collector_force = asyncio.create_task(collect_loadcell())
-    collector_pos_z = asyncio.create_task(collect_pos_z())
+    collector_force = asyncio.create_task(collect_metric(
+        stream, loadcell_metric, stop_collect, extract_force,
+        run.force_t, run.force_y, on_sample=latch_sweep_t0,
+    ))
+    collector_pos_z = asyncio.create_task(collect_metric(
+        stream, "pos_z", stop_collect, extract_numeric,
+        run.pos_z_t, run.pos_z,
+    ))
 
     try:
         async with PrusaLinkClient(
@@ -171,65 +159,16 @@ async def run_flow_test(
             run.state.message = "Job started; capturing loadcell stream…"
             run.emit()
 
-            import httpx
-            transient = (
-                httpx.ReadError, httpx.ReadTimeout, httpx.ConnectError,
-                httpx.ConnectTimeout, httpx.RemoteProtocolError,
+            await poll_job_until_done(
+                pl, run,
+                job_timeout_s=job_timeout_s,
+                poll_interval_s=poll_interval_s,
+                verb="Printing",
+                log_timeout_done=lambda final_state: log.warning(
+                    "flow job_timeout reached but final status %r -- "
+                    "treating as done", final_state,
+                ),
             )
-            t_start = time.monotonic()
-            last_progress = -1.0
-            last_status_state: str | None = None
-            consecutive_failures = 0
-            while True:
-                if time.monotonic() - t_start > job_timeout_s:
-                    try:
-                        final_status = await pl.get_job_status()
-                    except transient:
-                        final_status = None
-                    final_state = (
-                        final_status.state.upper() if final_status is not None
-                        else (last_status_state or "")
-                    )
-                    if final_state in ("FINISHED", "STOPPED", "CANCELLED", "IDLE", ""):
-                        log.warning(
-                            "flow job_timeout reached but final status %r -- "
-                            "treating as done", final_state,
-                        )
-                        break
-                    raise TimeoutError(
-                        f"job exceeded timeout ({job_timeout_s:.0f}s); "
-                        f"last known state: {final_state}"
-                    )
-                try:
-                    status = await pl.get_job_status()
-                    consecutive_failures = 0
-                except transient as exc:
-                    consecutive_failures += 1
-                    if consecutive_failures >= 10:
-                        raise RuntimeError(
-                            f"PrusaLink unresponsive after {consecutive_failures} "
-                            f"failures: {type(exc).__name__}: {exc}"
-                        )
-                    run.state.message = (
-                        f"Printing… (PrusaLink busy, retrying "
-                        f"{consecutive_failures}/10)"
-                    )
-                    run.emit()
-                    await asyncio.sleep(poll_interval_s)
-                    continue
-                if status is None:
-                    break
-                last_status_state = status.state.upper()
-                if last_status_state in ("FINISHED", "STOPPED", "CANCELLED", "IDLE"):
-                    break
-                if last_status_state in ("ERROR",):
-                    raise RuntimeError(f"printer reported ERROR: {status.raw}")
-                if status.progress_pct != last_progress:
-                    run.state.progress_pct = status.progress_pct
-                    run.state.message = f"Printing… {status.progress_pct:.0f}%"
-                    run.emit()
-                    last_progress = status.progress_pct
-                await asyncio.sleep(poll_interval_s)
 
         run.state.state = "analyzing"
         run.state.message = "Crunching flow-vs-force…"
@@ -246,9 +185,9 @@ async def run_flow_test(
         force_y = np.asarray(run.force_y, dtype=float)
         pos_z_t = np.asarray(run.pos_z_t, dtype=float) if run.pos_z_t else None
         pos_z = np.asarray(run.pos_z, dtype=float) if run.pos_z else None
-        force_t, force_y = _sort_by_time(force_t, force_y)
+        force_t, force_y = sort_by_time(force_t, force_y)
         if pos_z_t is not None and pos_z is not None:
-            pos_z_t, pos_z = _sort_by_time(pos_z_t, pos_z)
+            pos_z_t, pos_z = sort_by_time(pos_z_t, pos_z)
 
         analysis = analyse_flow(
             sweep_t0=run.state.sweep_t0,
@@ -277,12 +216,7 @@ async def run_flow_test(
         run.emit()
     finally:
         stop_collect.set()
-        for task in (collector_force, collector_pos_z):
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
+        await cancel_collectors((collector_force, collector_pos_z), log)
         log.info(
             "flow captured: %d loadcell, %d pos_z samples",
             len(run.force_t), len(run.pos_z),
@@ -300,9 +234,7 @@ def _dump_flow_run(
 ) -> None:
     """Save the raw arrays + plan scalars to runs/flow_<ts>.npz."""
     try:
-        runs_dir = Path("runs")
-        runs_dir.mkdir(exist_ok=True)
-        dump_path = runs_dir / f"flow_{int(run.state.started_at)}.npz"
+        dump_path = runs_dir() / f"flow_{int(run.state.started_at)}.npz"
         p = run.plan.params
         np.savez(
             dump_path,
@@ -311,8 +243,7 @@ def _dump_flow_run(
             pos_z_t=pos_z_t if pos_z_t is not None else np.array([]),
             pos_z=pos_z if pos_z is not None else np.array([]),
             sweep_t0=np.array([float(run.state.sweep_t0)]),
-            mono_anchor_mono=np.array([float(time.monotonic())]),
-            mono_anchor_unix=np.array([float(time.time())]),
+            **anchor_fields(),
             started_at_unix=np.array([float(run.state.started_at)]),
             flow_levels=np.array([s.flow_mm3_s for s in run.plan.segments], dtype=float),
             min_flow_mm3_s=np.array([p.min_flow_mm3_s]),
@@ -368,10 +299,7 @@ def list_flow_runs(runs_dir: str | os.PathLike = "runs") -> list[FlowRunInfo]:
             with np.load(f, allow_pickle=True) as d:
                 ft = d["force_t"] if "force_t" in d else np.array([])
                 levels = d["flow_levels"] if "flow_levels" in d else np.array([])
-
-                def _s(key: str, default: float) -> float:
-                    return float(d[key][0]) if key in d and len(d[key]) else default
-
+                _s = partial(npz_scalar, d)
                 label = ""
                 if "filament_label" in d and len(d["filament_label"]):
                     try:
@@ -402,9 +330,7 @@ def list_flow_runs(runs_dir: str | os.PathLike = "runs") -> list[FlowRunInfo]:
 def load_flow_run(path: str | os.PathLike) -> tuple[FlowPlan, dict[str, Any]]:
     """Rebuild a FlowPlan + analyse_flow kwargs from a saved flow npz."""
     d = np.load(path, allow_pickle=True)
-
-    def _s(key: str, default: float) -> float:
-        return float(d[key][0]) if key in d and len(d[key]) else default
+    _s = partial(npz_scalar, d)
 
     params = FlowRampParams(
         nozzle_temp=_s("nozzle_temp", 215.0),
@@ -426,11 +352,11 @@ def load_flow_run(path: str | os.PathLike) -> tuple[FlowPlan, dict[str, Any]]:
 
     force_t = np.asarray(d["force_t"], dtype=float)
     force_y = np.asarray(d["force_y"], dtype=float)
-    force_t, force_y = _sort_by_time(force_t, force_y)
+    force_t, force_y = sort_by_time(force_t, force_y)
     pos_z_t = np.asarray(d["pos_z_t"], dtype=float) if "pos_z_t" in d and len(d["pos_z_t"]) else None
     pos_z = np.asarray(d["pos_z"], dtype=float) if "pos_z" in d and len(d["pos_z"]) else None
     if pos_z_t is not None and pos_z is not None:
-        pos_z_t, pos_z = _sort_by_time(pos_z_t, pos_z)
+        pos_z_t, pos_z = sort_by_time(pos_z_t, pos_z)
 
     kwargs: dict[str, Any] = {
         "sweep_t0": _s("sweep_t0", float(force_t[0]) if len(force_t) else 0.0),

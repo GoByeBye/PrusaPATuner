@@ -12,6 +12,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable
 
@@ -22,7 +23,16 @@ from .probe_analysis import ProbeAnalysis, analyse_probe, probe_analysis_to_dict
 from .probe_gen import ProbeParams, ProbePlan, build_probe_test
 from .netutil import local_ip_toward
 from .prusalink import PrusaLinkClient
-from .runner import _extract_force, _extract_numeric, _sort_by_time
+from .run_lifecycle import (
+    anchor_fields,
+    cancel_collectors,
+    collect_metric,
+    npz_scalar,
+    poll_job_until_done,
+    runs_dir,
+    schedule_on_update,
+)
+from .sampling import extract_force, extract_numeric, sort_by_time
 from .udp_metrics import MetricStream
 
 log = logging.getLogger(__name__)
@@ -54,17 +64,7 @@ class ProbeRun:
     on_update: Callable[["ProbeRun"], None] | None = None
 
     def emit(self) -> None:
-        if self.on_update is None:
-            return
-        try:
-            result = self.on_update(self)
-            if asyncio.iscoroutine(result):
-                try:
-                    asyncio.get_running_loop().create_task(result)
-                except RuntimeError:
-                    result.close()
-        except Exception:
-            log.exception("probe on_update callback failed")
+        schedule_on_update(self.on_update, self, log, "probe on_update callback failed")
 
     def to_dict(self) -> dict[str, Any]:
         s = self.state
@@ -135,31 +135,23 @@ async def run_probe_test(
 
     stop_collect = asyncio.Event()
 
-    async def collect_force() -> None:
-        async for sample in stream.subscribe(loadcell_metric):
-            if stop_collect.is_set():
-                return
-            v = _extract_force(sample)
-            if v is None:
-                continue
-            run.force_t.append(sample.recv_monotonic)
-            run.force_y.append(v)
-
-    async def collect_pos(metric: str, t_list: list[float], y_list: list[float]) -> None:
-        async for sample in stream.subscribe(metric):
-            if stop_collect.is_set():
-                return
-            v = _extract_numeric(sample)
-            if v is None:
-                continue
-            t_list.append(sample.recv_monotonic)
-            y_list.append(v)
-
     collectors = [
-        asyncio.create_task(collect_force()),
-        asyncio.create_task(collect_pos("pos_x", run.pos_x_t, run.pos_x)),
-        asyncio.create_task(collect_pos("pos_y", run.pos_y_t, run.pos_y)),
-        asyncio.create_task(collect_pos("pos_z", run.pos_z_t, run.pos_z)),
+        asyncio.create_task(collect_metric(
+            stream, loadcell_metric, stop_collect, extract_force,
+            run.force_t, run.force_y,
+        )),
+        asyncio.create_task(collect_metric(
+            stream, "pos_x", stop_collect, extract_numeric,
+            run.pos_x_t, run.pos_x,
+        )),
+        asyncio.create_task(collect_metric(
+            stream, "pos_y", stop_collect, extract_numeric,
+            run.pos_y_t, run.pos_y,
+        )),
+        asyncio.create_task(collect_metric(
+            stream, "pos_z", stop_collect, extract_numeric,
+            run.pos_z_t, run.pos_z,
+        )),
     ]
 
     try:
@@ -173,65 +165,16 @@ async def run_probe_test(
             run.state.message = "Job started; capturing loadcell + position…"
             run.emit()
 
-            import httpx
-            transient = (
-                httpx.ReadError, httpx.ReadTimeout, httpx.ConnectError,
-                httpx.ConnectTimeout, httpx.RemoteProtocolError,
+            await poll_job_until_done(
+                pl, run,
+                job_timeout_s=job_timeout_s,
+                poll_interval_s=poll_interval_s,
+                verb="Probing",
+                log_timeout_done=lambda final_state: log.warning(
+                    "probe job_timeout reached but final status %r -- "
+                    "treating as done", final_state,
+                ),
             )
-            t_start = time.monotonic()
-            last_progress = -1.0
-            last_status_state: str | None = None
-            consecutive_failures = 0
-            while True:
-                if time.monotonic() - t_start > job_timeout_s:
-                    try:
-                        final_status = await pl.get_job_status()
-                    except transient:
-                        final_status = None
-                    final_state = (
-                        final_status.state.upper() if final_status is not None
-                        else (last_status_state or "")
-                    )
-                    if final_state in ("FINISHED", "STOPPED", "CANCELLED", "IDLE", ""):
-                        log.warning(
-                            "probe job_timeout reached but final status %r -- "
-                            "treating as done", final_state,
-                        )
-                        break
-                    raise TimeoutError(
-                        f"job exceeded timeout ({job_timeout_s:.0f}s); "
-                        f"last known state: {final_state}"
-                    )
-                try:
-                    status = await pl.get_job_status()
-                    consecutive_failures = 0
-                except transient as exc:
-                    consecutive_failures += 1
-                    if consecutive_failures >= 10:
-                        raise RuntimeError(
-                            f"PrusaLink unresponsive after {consecutive_failures} "
-                            f"failures: {type(exc).__name__}: {exc}"
-                        )
-                    run.state.message = (
-                        f"Probing… (PrusaLink busy, retrying "
-                        f"{consecutive_failures}/10)"
-                    )
-                    run.emit()
-                    await asyncio.sleep(poll_interval_s)
-                    continue
-                if status is None:
-                    break
-                last_status_state = status.state.upper()
-                if last_status_state in ("FINISHED", "STOPPED", "CANCELLED", "IDLE"):
-                    break
-                if last_status_state in ("ERROR",):
-                    raise RuntimeError(f"printer reported ERROR: {status.raw}")
-                if status.progress_pct != last_progress:
-                    run.state.progress_pct = status.progress_pct
-                    run.state.message = f"Probing… {status.progress_pct:.0f}%"
-                    run.emit()
-                    last_progress = status.progress_pct
-                await asyncio.sleep(poll_interval_s)
 
         run.state.state = "analyzing"
         run.state.message = "Crunching force-vs-position…"
@@ -239,15 +182,15 @@ async def run_probe_test(
 
         force_t = np.asarray(run.force_t, dtype=float)
         force_y = np.asarray(run.force_y, dtype=float)
-        force_t, force_y = _sort_by_time(force_t, force_y)
+        force_t, force_y = sort_by_time(force_t, force_y)
         px_t = np.asarray(run.pos_x_t, dtype=float) if run.pos_x_t else None
         px = np.asarray(run.pos_x, dtype=float) if run.pos_x else None
         py_t = np.asarray(run.pos_y_t, dtype=float) if run.pos_y_t else None
         py = np.asarray(run.pos_y, dtype=float) if run.pos_y else None
         if px_t is not None and px is not None:
-            px_t, px = _sort_by_time(px_t, px)
+            px_t, px = sort_by_time(px_t, px)
         if py_t is not None and py is not None:
-            py_t, py = _sort_by_time(py_t, py)
+            py_t, py = sort_by_time(py_t, py)
 
         if plan.axis == "X":
             probe_pos_t, probe_pos = px_t, px
@@ -275,12 +218,7 @@ async def run_probe_test(
         run.emit()
     finally:
         stop_collect.set()
-        for task in collectors:
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
+        await cancel_collectors(collectors, log)
         log.info(
             "probe captured: %d loadcell, %d pos_x, %d pos_y, %d pos_z samples",
             len(run.force_t), len(run.pos_x), len(run.pos_y), len(run.pos_z),
@@ -300,9 +238,7 @@ def _dump_probe_run(
 ) -> None:
     """Save the raw arrays + plan scalars to runs/probe_<ts>.npz."""
     try:
-        runs_dir = Path("runs")
-        runs_dir.mkdir(exist_ok=True)
-        dump_path = runs_dir / f"probe_{int(run.state.started_at)}.npz"
+        dump_path = runs_dir() / f"probe_{int(run.state.started_at)}.npz"
         p = run.plan.params
         np.savez(
             dump_path,
@@ -314,8 +250,7 @@ def _dump_probe_run(
             pos_y=py if py is not None else np.array([]),
             pos_z_t=np.asarray(run.pos_z_t, dtype=float),
             pos_z=np.asarray(run.pos_z, dtype=float),
-            mono_anchor_mono=np.array([float(time.monotonic())]),
-            mono_anchor_unix=np.array([float(time.time())]),
+            **anchor_fields(),
             started_at_unix=np.array([float(run.state.started_at)]),
             probe_axis=np.array([run.plan.axis], dtype="U2"),
             dir_sign=np.array([run.plan.dir_sign]),
@@ -362,10 +297,7 @@ def list_probe_runs(runs_dir: str | os.PathLike = "runs") -> list[ProbeRunInfo]:
         try:
             with np.load(f, allow_pickle=True) as d:
                 ft = d["force_t"] if "force_t" in d else np.array([])
-
-                def _s(key: str, default: float) -> float:
-                    return float(d[key][0]) if key in d and len(d[key]) else default
-
+                _s = partial(npz_scalar, d)
                 axis = "X"
                 if "probe_axis" in d and len(d["probe_axis"]):
                     try:
@@ -395,9 +327,7 @@ def list_probe_runs(runs_dir: str | os.PathLike = "runs") -> list[ProbeRunInfo]:
 def load_probe_run(path: str | os.PathLike) -> tuple[ProbePlan, dict[str, Any]]:
     """Rebuild a ProbePlan + analyse_probe kwargs from a saved probe npz."""
     d = np.load(path, allow_pickle=True)
-
-    def _s(key: str, default: float) -> float:
-        return float(d[key][0]) if key in d and len(d[key]) else default
+    _s = partial(npz_scalar, d)
 
     axis = "X"
     if "probe_axis" in d and len(d["probe_axis"]):
@@ -424,7 +354,7 @@ def load_probe_run(path: str | os.PathLike) -> tuple[ProbePlan, dict[str, Any]]:
 
     force_t = np.asarray(d["force_t"], dtype=float)
     force_y = np.asarray(d["force_y"], dtype=float)
-    force_t, force_y = _sort_by_time(force_t, force_y)
+    force_t, force_y = sort_by_time(force_t, force_y)
 
     def _arr(key: str) -> np.ndarray | None:
         return np.asarray(d[key], dtype=float) if key in d and len(d[key]) else None
@@ -432,9 +362,9 @@ def load_probe_run(path: str | os.PathLike) -> tuple[ProbePlan, dict[str, Any]]:
     px_t, px = _arr("pos_x_t"), _arr("pos_x")
     py_t, py = _arr("pos_y_t"), _arr("pos_y")
     if px_t is not None and px is not None:
-        px_t, px = _sort_by_time(px_t, px)
+        px_t, px = sort_by_time(px_t, px)
     if py_t is not None and py is not None:
-        py_t, py = _sort_by_time(py_t, py)
+        py_t, py = sort_by_time(py_t, py)
     if axis == "X":
         pos_t, pos = px_t, px
     else:

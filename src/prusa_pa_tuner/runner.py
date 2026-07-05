@@ -14,9 +14,25 @@ from .config import AppConfig
 from .gcode_gen import SweepParams, SweepPlan, build_sweep
 from .netutil import local_ip_toward
 from .prusalink import PrusaLinkClient
-from .udp_metrics import MetricSample, MetricStream
+from .run_lifecycle import (
+    anchor_fields,
+    cancel_collectors,
+    collect_metric,
+    poll_job_until_done,
+    runs_dir,
+    schedule_on_update,
+)
+from .sampling import extract_force, extract_numeric, sort_by_time
+from .udp_metrics import MetricStream
 
 log = logging.getLogger(__name__)
+
+# Backward-compat aliases: the flow/probe/livemap runners and some tests
+# historically imported these underscore-private helpers from this module.
+# The implementations now live in sampling.py.
+_extract_force = extract_force
+_extract_numeric = extract_numeric
+_sort_by_time = sort_by_time
 
 
 @dataclass(slots=True)
@@ -59,22 +75,7 @@ class TuningRun:
     on_update: Callable[["TuningRun"], None] | None = None
 
     def emit(self) -> None:
-        if self.on_update is None:
-            return
-        try:
-            result = self.on_update(self)
-            # If the callback is async (e.g. the FastAPI WebSocket broadcaster),
-            # schedule it as a task so the coroutine actually runs. Without this
-            # the call site just creates an unawaited coroutine and Python emits
-            # "coroutine X was never awaited" while no client ever sees updates.
-            if asyncio.iscoroutine(result):
-                try:
-                    asyncio.get_running_loop().create_task(result)
-                except RuntimeError:
-                    # no running loop (e.g. called from a sync test) -- drop it
-                    result.close()
-        except Exception:  # broadcast must never fail the run
-            log.exception("on_update callback failed")
+        schedule_on_update(self.on_update, self, log)
 
     def to_dict(self) -> dict[str, Any]:
         s = self.state
@@ -297,31 +298,6 @@ def _safe_float(x: float) -> float | None:
         return None
 
 
-def _sort_by_time(
-    t: np.ndarray, y: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return (t, y) sorted by t ascending. Uses argsort with kind='stable'
-    so samples with equal timestamps keep their original order.
-
-    Necessary because the UDP stream can deliver per-metric samples
-    with overlapping timestamps when consecutive packets cover
-    overlapping firmware-time spans (the firmware-offset spread in
-    udp_metrics anchors each batch at its own host arrival time, so
-    when host inter-packet gap is shorter than the batch's firmware
-    span, the second batch's earliest samples land before the first
-    batch's latest). udp_metrics also clips to enforce monotonicity,
-    but a defensive sort here means any future bug or network reorder
-    won't break the plots / segment slicing.
-    """
-    if len(t) <= 1:
-        return t, y
-    # Skip the sort when already monotonic (the common case).
-    if bool(np.all(np.diff(t) >= 0)):
-        return t, y
-    order = np.argsort(t, kind="stable")
-    return t[order], y[order]
-
-
 def _k_range(k_min: float, k_max: float, k_step: float) -> tuple[float, ...]:
     """Inclusive K grid from min..max in step increments.
 
@@ -387,58 +363,6 @@ def params_from_config(cfg: AppConfig, udp_host: str) -> SweepParams:
     )
 
 
-def _extract_numeric(sample: MetricSample) -> float | None:
-    """Pull the first finite numeric value out of a sample.
-
-    Used for position metrics (pos_x / pos_y / pos_z) and any other plain-
-    value telemetry. Unlike _extract_force we look at `v` first (the canonical
-    field name on this firmware), then fall through to any other numeric.
-    """
-    import math
-    f = sample.fields
-    v = f.get("v")
-    if isinstance(v, (int, float)) and not isinstance(v, bool):
-        x = float(v)
-        if math.isfinite(x):
-            return x
-    for val in f.values():
-        if isinstance(val, (int, float)) and not isinstance(val, bool):
-            x = float(val)
-            if math.isfinite(x):
-                return x
-    return None
-
-
-def _extract_force(sample: MetricSample) -> float | None:
-    """Try the well-known field names from probe_load_line / loadcell metrics.
-
-    The exact field name depends on what's actually streaming. We accept any of:
-      - `v` (single value)
-      - `load` / `force` / `z` (named field)
-      - the first numeric field in the sample as a last resort.
-
-    NaN values are rejected (return None). loadcell_hp streams `v=nan` while
-    the loadcell is idle -- if we let those through, the "first metric to
-    deliver wins" race would lock onto loadcell_hp and flood force_y with
-    NaNs, breaking downstream analysis.
-    """
-    import math
-    f = sample.fields
-    for key in ("load", "force", "z", "v"):
-        if key in f and isinstance(f[key], (int, float)) and not isinstance(f[key], bool):
-            v = float(f[key])
-            if math.isnan(v) or math.isinf(v):
-                return None
-            return v
-    for v in f.values():
-        if isinstance(v, (int, float)) and not isinstance(v, bool):
-            x = float(v)
-            if math.isnan(x) or math.isinf(x):
-                continue
-            return x
-    return None
-
-
 async def run_tuning(
     cfg: AppConfig,
     stream: MetricStream,
@@ -502,34 +426,23 @@ async def run_tuning(
     #     for diagnostic completeness.
     stop_collect = asyncio.Event()
 
-    async def collect_loadcell() -> None:
-        async for sample in stream.subscribe(loadcell_metric):
-            if stop_collect.is_set():
-                return
-            v = _extract_force(sample)
-            if v is None:
-                continue
-            run.force_t.append(sample.recv_monotonic)
-            run.force_y.append(v)
-            if run.state.sweep_t0 is None and run.state.state == "running":
-                run.state.sweep_t0 = sample.recv_monotonic
+    def latch_sweep_t0(sample, v) -> None:
+        if run.state.sweep_t0 is None and run.state.state == "running":
+            run.state.sweep_t0 = sample.recv_monotonic
 
-    async def collect_pos(
-        metric: str, t_list: list[float], y_list: list[float],
-    ) -> None:
-        async for sample in stream.subscribe(metric):
-            if stop_collect.is_set():
-                return
-            v = _extract_numeric(sample)
-            if v is None:
-                continue
-            t_list.append(sample.recv_monotonic)
-            y_list.append(v)
-
-    collector_primary = asyncio.create_task(collect_loadcell())
-    collector_pos_x = asyncio.create_task(collect_pos("pos_x", run.pos_t, run.pos_x))
-    collector_pos_y = asyncio.create_task(collect_pos("pos_y", run.pos_y_t, run.pos_y))
-    collector_pos_z = asyncio.create_task(collect_pos("pos_z", run.pos_z_t, run.pos_z))
+    collector_primary = asyncio.create_task(collect_metric(
+        stream, loadcell_metric, stop_collect, extract_force,
+        run.force_t, run.force_y, on_sample=latch_sweep_t0,
+    ))
+    collector_pos_x = asyncio.create_task(collect_metric(
+        stream, "pos_x", stop_collect, extract_numeric, run.pos_t, run.pos_x,
+    ))
+    collector_pos_y = asyncio.create_task(collect_metric(
+        stream, "pos_y", stop_collect, extract_numeric, run.pos_y_t, run.pos_y,
+    ))
+    collector_pos_z = asyncio.create_task(collect_metric(
+        stream, "pos_z", stop_collect, extract_numeric, run.pos_z_t, run.pos_z,
+    ))
 
     try:
         async with PrusaLinkClient(
@@ -545,86 +458,25 @@ async def run_tuning(
             run.state.message = "Job started; capturing loadcell stream…"
             run.emit()
 
-            # poll job progress. The Core One occasionally drops HTTP
-            # connections during long heatups / homing -- httpx surfaces
-            # this as ReadError / ReadTimeout / ConnectError. None of those
-            # mean the job actually failed; just back off and retry.
-            import httpx
-            transient = (
-                httpx.ReadError,
-                httpx.ReadTimeout,
-                httpx.ConnectError,
-                httpx.ConnectTimeout,
-                httpx.RemoteProtocolError,
+            # poll job progress (transient-error handling rationale lives
+            # in run_lifecycle.poll_job_until_done).
+            await poll_job_until_done(
+                pl, run,
+                job_timeout_s=job_timeout_s,
+                poll_interval_s=poll_interval_s,
+                verb="Printing",
+                unresponsive_noun="consecutive failures",
+                transient_retry_log=lambda name, n: log.warning(
+                    "transient PrusaLink error %s (%s/10); retrying",
+                    name, n,
+                ),
+                log_timeout_done=lambda final_state: log.warning(
+                    "job_timeout_s=%.0f reached but final status "
+                    "is %r -- treating as completed, continuing "
+                    "to analysis with the data captured so far",
+                    job_timeout_s, final_state,
+                ),
             )
-            t_start = time.monotonic()
-            last_progress = -1.0
-            last_status_state: str | None = None
-            consecutive_failures = 0
-            while True:
-                if time.monotonic() - t_start > job_timeout_s:
-                    # Before giving up, do one final blocking status
-                    # check. The user's machine sometimes finishes the
-                    # gcode while we're between polls; if a final poll
-                    # confirms FINISHED/STOPPED/IDLE, the print is
-                    # actually done and we should analyse, not error.
-                    try:
-                        final_status = await pl.get_job_status()
-                    except transient:
-                        final_status = None
-                    final_state = (
-                        final_status.state.upper() if final_status is not None
-                        else (last_status_state or "")
-                    )
-                    if final_state in ("FINISHED", "STOPPED", "CANCELLED", "IDLE", ""):
-                        log.warning(
-                            "job_timeout_s=%.0f reached but final status "
-                            "is %r -- treating as completed, continuing "
-                            "to analysis with the data captured so far",
-                            job_timeout_s, final_state,
-                        )
-                        break
-                    raise TimeoutError(
-                        f"job exceeded timeout ({job_timeout_s:.0f}s); "
-                        f"last known state: {final_state}"
-                    )
-                try:
-                    status = await pl.get_job_status()
-                    consecutive_failures = 0
-                except transient as exc:
-                    consecutive_failures += 1
-                    # Tolerate a handful of transient drops; only fail if
-                    # they pile up (suggesting the printer is actually gone).
-                    if consecutive_failures >= 10:
-                        raise RuntimeError(
-                            f"PrusaLink unresponsive after {consecutive_failures} "
-                            f"consecutive failures: {type(exc).__name__}: {exc}"
-                        )
-                    log.warning(
-                        "transient PrusaLink error %s (%s/10); retrying",
-                        type(exc).__name__, consecutive_failures,
-                    )
-                    run.state.message = (
-                        f"Printing… (PrusaLink busy, retrying "
-                        f"{consecutive_failures}/10)"
-                    )
-                    run.emit()
-                    await asyncio.sleep(poll_interval_s)
-                    continue
-                if status is None:
-                    # job already gone — assume finished
-                    break
-                last_status_state = status.state.upper()
-                if last_status_state in ("FINISHED", "STOPPED", "CANCELLED", "IDLE"):
-                    break
-                if last_status_state in ("ERROR",):
-                    raise RuntimeError(f"printer reported ERROR: {status.raw}")
-                if status.progress_pct != last_progress:
-                    run.state.progress_pct = status.progress_pct
-                    run.state.message = f"Printing… {status.progress_pct:.0f}%"
-                    run.emit()
-                    last_progress = status.progress_pct
-                await asyncio.sleep(poll_interval_s)
 
         # analyse
         run.state.state = "analyzing"
@@ -649,11 +501,11 @@ async def run_tuning(
         # timestamps out of order. Sort each stream by time before
         # analysis so window slicing and segment metrics see a
         # well-ordered timeline.
-        force_t, force_y = _sort_by_time(force_t, force_y)
+        force_t, force_y = sort_by_time(force_t, force_y)
         if pos_t is not None and pos_x is not None:
-            pos_t, pos_x = _sort_by_time(pos_t, pos_x)
+            pos_t, pos_x = sort_by_time(pos_t, pos_x)
         if pos_z_t is not None and pos_z_arr is not None:
-            pos_z_t, pos_z_arr = _sort_by_time(pos_z_t, pos_z_arr)
+            pos_z_t, pos_z_arr = sort_by_time(pos_z_t, pos_z_arr)
         analysis = analyse_sweep(
             sweep_t0=run.state.sweep_t0,
             force_t=force_t,
@@ -672,17 +524,7 @@ async def run_tuning(
         # carries all the timestamped streams. The path is appended to
         # the analyser notes so it surfaces in the UI / on the API.
         try:
-            from pathlib import Path
-            runs_dir = Path("runs")
-            runs_dir.mkdir(exist_ok=True)
-            dump_path = runs_dir / f"run_{int(run.state.started_at)}.npz"
-            # Wall-clock anchor: pair the current monotonic instant
-            # with the corresponding wall-clock unix timestamp. With
-            # both, every monotonic sample can be converted to a UTC
-            # datetime in post-processing:
-            #   wall_unix(sample) = mono_anchor_unix + (sample.mono - mono_anchor_mono)
-            mono_anchor_mono = time.monotonic()
-            mono_anchor_unix = time.time()
+            dump_path = runs_dir() / f"run_{int(run.state.started_at)}.npz"
             # Deterministic packet-loss log from msg= sequence gaps
             # (see MetricStream.loss_events). Empty arrays when the
             # stream never saw syslog-wrapped packets.
@@ -712,14 +554,13 @@ async def run_tuning(
                 pos_z_t=pos_z_t if pos_z_t is not None else np.array([]),
                 pos_z=pos_z_arr if pos_z_arr is not None else np.array([]),
                 sweep_t0=np.array([float(run.state.sweep_t0)]),
-                # Time-domain anchor for monotonic → wall-clock conversion.
-                # mono_anchor_mono is the monotonic instant we captured;
-                # mono_anchor_unix is the wall-clock unix time at that
-                # same instant. Subtract mono_anchor_mono from any
-                # *_t array, add mono_anchor_unix, and you have a unix
-                # timestamp (seconds since 1970-01-01 UTC).
-                mono_anchor_mono=np.array([float(mono_anchor_mono)]),
-                mono_anchor_unix=np.array([float(mono_anchor_unix)]),
+                # Time-domain anchor for monotonic → wall-clock conversion:
+                # mono_anchor_mono / mono_anchor_unix pair the capture
+                # instant in both clocks. Subtract mono_anchor_mono from
+                # any *_t array, add mono_anchor_unix, and you have a unix
+                # timestamp (seconds since 1970-01-01 UTC). See
+                # run_lifecycle.anchor_fields.
+                **anchor_fields(),
                 started_at_unix=np.array([float(run.state.started_at)]),
                 k_values=np.array([seg.k for seg in plan.segments], dtype=float),
                 cycle_period_s=np.array([plan.segments[0].cycle_period_s]) if plan.segments else np.array([]),
@@ -781,12 +622,10 @@ async def run_tuning(
         run.emit()
     finally:
         stop_collect.set()
-        for task in (collector_primary, collector_pos_x, collector_pos_y, collector_pos_z):
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
+        await cancel_collectors(
+            (collector_primary, collector_pos_x, collector_pos_y, collector_pos_z),
+            log,
+        )
         log.info(
             "captured: %d loadcell, %d pos_x, %d pos_y, %d pos_z samples",
             len(run.force_t), len(run.pos_x), len(run.pos_y), len(run.pos_z),
