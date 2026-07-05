@@ -361,6 +361,17 @@ function fmt(v, digits = 3) {
   return v.toFixed(digits);
 }
 
+// Shared Plotly layout base for the dark result-plot panels. Every result
+// plot repeats the same paper/plot colours + font; callers pass everything
+// else (margins, axes, legend, shapes, ...) as overrides.
+function panelLayout(overrides) {
+  return Object.assign({
+    paper_bgcolor: "#1f242c",
+    plot_bgcolor: "#1f242c",
+    font: { color: "#e6edf3", size: 11 },
+  }, overrides);
+}
+
 function downsampleXY(xs, ys, maxPoints) {
   const n = Math.min(xs.length, ys.length);
   if (n <= maxPoints) return [xs.slice(0, n), ys.slice(0, n)];
@@ -758,17 +769,14 @@ function _drawBdSegmentPlot(seg, window_) {
       hovertemplate: "dropout<br>t=%{x:.3f}s<extra></extra>",
     });
   }
-  const layout = {
+  const layout = panelLayout({
     margin: { l: 60, r: 20, t: 8, b: 36 },
-    paper_bgcolor: "#1f242c",
-    plot_bgcolor: "#1f242c",
-    font: { color: "#e6edf3", size: 11 },
     xaxis: { gridcolor: "#2a2f37", title: "t (s, segment-relative)" },
     yaxis: { gridcolor: "#2a2f37", title: "force (raw)", zeroline: false },
     showlegend: false,
     shapes: shapes,
     annotations: annotations,
-  };
+  });
   Plotly.react(plot, traces, layout, { displayModeBar: false, responsive: true });
 }
 
@@ -996,15 +1004,13 @@ function _drawBdCostPlot(ks, cost, kOpt) {
       line: { color: "#2ea043", dash: "dash", width: 1.5 },
     });
   }
-  const layout = {
+  const layout = panelLayout({
     margin: { l: 50, r: 20, t: 8, b: 36 },
-    paper_bgcolor: "#1f242c", plot_bgcolor: "#1f242c",
-    font: { color: "#e6edf3", size: 11 },
     xaxis: { gridcolor: "#2a2f37", title: "K" },
     yaxis: { gridcolor: "#2a2f37", title: "composite cost" },
     showlegend: false,
     shapes: shapes,
-  };
+  });
   Plotly.react(plot, traces, layout, { displayModeBar: false, responsive: true });
 }
 
@@ -1184,15 +1190,12 @@ function plotFit(divId, k, y, fit, yTitle, customdata) {
       name: "K_opt",
     });
   }
-  const layout = {
+  const layout = panelLayout({
     margin: { l: 50, r: 10, t: 10, b: 40 },
-    paper_bgcolor: "#1f242c",
-    plot_bgcolor: "#1f242c",
-    font: { color: "#e6edf3", size: 11 },
     xaxis: { gridcolor: "#2a2f37", title: "K" },
     yaxis: { gridcolor: "#2a2f37", title: yTitle, zeroline: true, zerolinecolor: "#444" },
     showlegend: false,
-  };
+  });
   Plotly.newPlot(divId, traces, layout, { displayModeBar: false, responsive: true });
 }
 
@@ -1225,11 +1228,8 @@ function plotArgmin(divId, k, y, kOpt, yTitle, zeroLine) {
       name: "K_opt",
     });
   }
-  const layout = {
+  const layout = panelLayout({
     margin: { l: 50, r: 10, t: 10, b: 40 },
-    paper_bgcolor: "#1f242c",
-    plot_bgcolor: "#1f242c",
-    font: { color: "#e6edf3", size: 11 },
     xaxis: { gridcolor: "#2a2f37", title: "K" },
     yaxis: {
       gridcolor: "#2a2f37",
@@ -1238,7 +1238,7 @@ function plotArgmin(divId, k, y, kOpt, yTitle, zeroLine) {
       zerolinecolor: "#444",
     },
     showlegend: false,
-  };
+  });
   Plotly.newPlot(divId, traces, layout, { displayModeBar: false, responsive: true });
 }
 
@@ -1408,6 +1408,97 @@ async function downloadXlsx(url, fallbackName) {
   }
 }
 
+// ---- shared run-picker helpers ----
+// The four modules (PA / Max Flow / Touch Probe / Live Map) each have a
+// saved-runs <select> refreshed from a list endpoint, an optional one-line
+// meta readout under it, a replay loader, and xlsx export buttons. The
+// factories below capture that mechanically identical plumbing; each module
+// supplies only its ids, endpoints, store, and formatting.
+
+// Refresher: fetch the run list, rebuild the <select> (preserving the
+// current selection), re-fill the per-filename lookup `store`, and
+// re-render the meta line (when the module has one).
+function makeRunsRefresher({ selectId, listUrl, store, formatOption, renderMeta }) {
+  return async function () {
+    const sel = $(selectId);
+    if (!sel) return;
+    try {
+      const r = await fetch(listUrl);
+      if (!r.ok) return;
+      const data = await r.json();
+      const prev = sel.value;
+      sel.innerHTML = '<option value="">— select —</option>';
+      // Reset and re-fill the lookup table.
+      for (const key of Object.keys(store)) delete store[key];
+      for (const run of (data.runs || [])) {
+        store[run.filename] = run;
+        const opt = document.createElement("option");
+        opt.value = run.filename;
+        opt.textContent = formatOption(run, _formatLocalTimestamp(run.mtime_unix));
+        sel.appendChild(opt);
+      }
+      sel.value = prev;
+      if (renderMeta) renderMeta(sel.value);
+    } catch (_) { /* network hiccup -- next refresh handles it */ }
+  };
+}
+
+// Meta line under the dropdown: looks the run up in `store` by filename
+// and shows `formatMeta(run)` (empty when nothing / unknown is selected).
+function makeRunMetaRenderer({ metaElId, store, formatMeta }) {
+  return function (filename) {
+    const el = $(metaElId);
+    if (!el) return;
+    const run = store[filename];
+    el.textContent = run ? formatMeta(run) : "";
+  };
+}
+
+// Replay loader: POST the analyse endpoint for the picked file and hand the
+// response to `onLoaded(filename, data)`. `onClear()` runs when the picker
+// returns to "— select —". (The PA loader and the Live Map review loader
+// have extra behavior — annotation card / summary setup — so they stay
+// hand-written; only Flow and Probe use this.)
+function makeReplayLoader({ analyseUrl, onClear, onLoaded }) {
+  return async function (filename) {
+    if (!filename) { onClear(); return; }
+    try {
+      const r = await fetch(analyseUrl(filename), { method: "POST" });
+      if (!r.ok) { alert("Replay failed: " + (await r.text())); return; }
+      onLoaded(filename, await r.json());
+    } catch (e) {
+      alert("Replay error: " + e);
+    }
+  };
+}
+
+// XLSX export buttons. `selectedBtnId` exports whatever saved run the
+// dropdown has selected (no need to load it first); `currentBtnId` (absent
+// for Live Map) exports whatever the page is currently showing -- the
+// loaded replay if there is one (read via `getLoadedReplay` at click time),
+// otherwise the just-finished live run held in server memory.
+function wireExportButtons({
+  selectedBtnId, currentBtnId, selectId, noneSelectedMsg,
+  exportUrl, getLoadedReplay, currentUrl, currentName,
+}) {
+  const btnSelected = $(selectedBtnId);
+  if (btnSelected) btnSelected.onclick = () => {
+    const fn = $(selectId).value;
+    if (!fn) { alert(noneSelectedMsg); return; }
+    downloadXlsx(exportUrl(fn), fn.replace(/\.npz$/, ".xlsx"));
+  };
+  if (!currentBtnId) return;
+  const btnCurrent = $(currentBtnId);
+  if (btnCurrent) btnCurrent.onclick = () => {
+    const loaded = getLoadedReplay();
+    if (loaded) {
+      downloadXlsx(exportUrl(loaded), loaded.replace(/\.npz$/, ".xlsx"));
+    } else {
+      downloadXlsx(currentUrl, currentName);
+    }
+  };
+}
+
 // ---- Max Flow test ----
 let lastFlowData = null;          // last flow run/replay data (copy/export)
 let lastFlowState = null;
@@ -1560,10 +1651,8 @@ function renderFlowResults(a) {
       font: { color, size: 10 }, yanchor: "bottom",
     });
   }
-  const layout = {
+  const layout = panelLayout({
     margin: { l: 55, r: 58, t: 16, b: 42 },
-    paper_bgcolor: "#1f242c", plot_bgcolor: "#1f242c",
-    font: { color: "#e6edf3", size: 11 },
     xaxis: { gridcolor: "#2a2f37", title: "flow rate (mm³/s)" },
     yaxis: { gridcolor: "#2a2f37", title: "nozzle force (raw, tared)" },
     yaxis2: {
@@ -1575,7 +1664,7 @@ function renderFlowResults(a) {
     showlegend: true,
     legend: { x: 0.02, y: 0.98, bgcolor: "rgba(0,0,0,0)", font: { size: 10 } },
     shapes, annotations: annos,
-  };
+  });
   Plotly.react("flow_plot", traces, layout, { displayModeBar: false, responsive: true });
 
   renderFlowViewer(a);
@@ -1650,16 +1739,14 @@ function renderFlowLevel() {
     x0: lv.t_settle, x1: lv.t_end, y0: 0, y1: 1,
     fillcolor: "rgba(46,160,67,0.12)", line: { width: 0 },
   }];
-  const layout = {
+  const layout = panelLayout({
     margin: { l: 55, r: 10, t: 10, b: 36 },
-    paper_bgcolor: "#1f242c", plot_bgcolor: "#1f242c",
-    font: { color: "#e6edf3", size: 11 },
     xaxis: { gridcolor: "#2a2f37", title: "t (s, from sweep start)" },
     yaxis: { gridcolor: "#2a2f37", title: "nozzle force (raw, tared)" },
     showlegend: true,
     legend: { x: 0.02, y: 0.98, bgcolor: "rgba(0,0,0,0)", font: { size: 10 } },
     shapes,
-  };
+  });
   Plotly.react("flow_level_plot", traces, layout, { displayModeBar: false, responsive: true });
 
   const fmt = (v, d = 2) =>
@@ -1695,55 +1782,37 @@ async function copyFlowMax() {
   setTimeout(() => ($("flow_copy_status").textContent = ""), 3000);
 }
 
-function _renderFlowRunMeta(filename) {
-  const el = $("flow_run_meta");
-  if (!el) return;
-  const run = flowRunsByFilename[filename];
-  if (!run) { el.textContent = ""; return; }
-  const parts = [];
-  if (run.filament_label) parts.push(run.filament_label);
-  if (run.nozzle_temp > 0) parts.push(`${run.nozzle_temp.toFixed(0)} °C`);
-  parts.push(`${run.min_flow}–${run.max_flow} mm³/s`);
-  el.textContent = parts.join("  ·  ");
-}
+const _renderFlowRunMeta = makeRunMetaRenderer({
+  metaElId: "flow_run_meta",
+  store: flowRunsByFilename,
+  formatMeta: (run) => {
+    const parts = [];
+    if (run.filament_label) parts.push(run.filament_label);
+    if (run.nozzle_temp > 0) parts.push(`${run.nozzle_temp.toFixed(0)} °C`);
+    parts.push(`${run.min_flow}–${run.max_flow} mm³/s`);
+    return parts.join("  ·  ");
+  },
+});
 
-async function refreshFlowRunsList() {
-  const sel = $("flow_runs_select");
-  if (!sel) return;
-  try {
-    const r = await fetch("/api/flow/runs");
-    if (!r.ok) return;
-    const data = await r.json();
-    const prev = sel.value;
-    sel.innerHTML = '<option value="">— select —</option>';
-    for (const key of Object.keys(flowRunsByFilename)) delete flowRunsByFilename[key];
-    for (const run of (data.runs || [])) {
-      flowRunsByFilename[run.filename] = run;
-      const opt = document.createElement("option");
-      opt.value = run.filename;
-      const date = _formatLocalTimestamp(run.mtime_unix);
-      opt.textContent = `${date}  ${run.min_flow}–${run.max_flow} mm³/s  (${run.filename})`;
-      sel.appendChild(opt);
-    }
-    sel.value = prev;
-    _renderFlowRunMeta(sel.value);
-  } catch (_) { /* next refresh handles it */ }
-}
+const refreshFlowRunsList = makeRunsRefresher({
+  selectId: "flow_runs_select",
+  listUrl: "/api/flow/runs",
+  store: flowRunsByFilename,
+  formatOption: (run, date) =>
+    `${date}  ${run.min_flow}–${run.max_flow} mm³/s  (${run.filename})`,
+  renderMeta: _renderFlowRunMeta,
+});
 
-async function loadFlowReplay(filename) {
-  if (!filename) { loadedFlowReplayFilename = null; return; }
-  try {
-    const r = await fetch(
-      `/api/flow/runs/${encodeURIComponent(filename)}/analyse`, { method: "POST" });
-    if (!r.ok) { alert("Replay failed: " + (await r.text())); return; }
-    const data = await r.json();
+const loadFlowReplay = makeReplayLoader({
+  analyseUrl: (filename) =>
+    `/api/flow/runs/${encodeURIComponent(filename)}/analyse`,
+  onClear: () => { loadedFlowReplayFilename = null; },
+  onLoaded: (filename, data) => {
     loadedFlowReplayFilename = filename;
     lastFlowData = { analysis: data.analysis };
     renderFlowResults(data.analysis);
-  } catch (e) {
-    alert("Replay error: " + e);
-  }
-}
+  },
+});
 
 // ---- Touch Probe ----
 let lastProbeData = null;
@@ -1839,16 +1908,14 @@ function renderProbeResults(a) {
       });
     }
   });
-  const layout = {
+  const layout = panelLayout({
     margin: { l: 55, r: 10, t: 10, b: 42 },
-    paper_bgcolor: "#1f242c", plot_bgcolor: "#1f242c",
-    font: { color: "#e6edf3", size: 11 },
     xaxis: { gridcolor: "#2a2f37", title: "probe-axis position (mm from standoff)" },
     yaxis: { gridcolor: "#2a2f37", title: "nozzle force (raw, tared)" },
     showlegend: true,
     legend: { x: 0.02, y: 0.98, bgcolor: "rgba(0,0,0,0)", font: { size: 10 } },
     shapes,
-  };
+  });
   Plotly.react("probe_plot", traces, layout, { displayModeBar: false, responsive: true });
 
   renderProbeViewer(a);
@@ -1922,16 +1989,14 @@ function renderProbeTouch() {
       line: { color: "#2ea043", width: 2, dash: "dash" },
     });
   }
-  const layout = {
+  const layout = panelLayout({
     margin: { l: 55, r: 10, t: 10, b: 42 },
-    paper_bgcolor: "#1f242c", plot_bgcolor: "#1f242c",
-    font: { color: "#e6edf3", size: 11 },
     xaxis: { gridcolor: "#2a2f37", title: "probe-axis position (mm from standoff)" },
     yaxis: { gridcolor: "#2a2f37", title: "nozzle force (raw, tared)" },
     showlegend: true,
     legend: { x: 0.02, y: 0.98, bgcolor: "rgba(0,0,0,0)", font: { size: 10 } },
     shapes,
-  };
+  });
   Plotly.react("probe_touch_plot", traces, layout, { displayModeBar: false, responsive: true });
 
   const fmt = (v, d = 3) =>
@@ -1955,52 +2020,32 @@ function probeStep(delta) {
   renderProbeTouch();
 }
 
-function _renderProbeRunMeta(filename) {
-  const el = $("probe_run_meta");
-  if (!el) return;
-  const run = probeRunsByFilename[filename];
-  if (!run) { el.textContent = ""; return; }
-  el.textContent =
-    `${run.axis}${run.dir}  ·  ${run.n_touches} touches  ·  ${run.creep_mm} mm creep`;
-}
+const _renderProbeRunMeta = makeRunMetaRenderer({
+  metaElId: "probe_run_meta",
+  store: probeRunsByFilename,
+  formatMeta: (run) =>
+    `${run.axis}${run.dir}  ·  ${run.n_touches} touches  ·  ${run.creep_mm} mm creep`,
+});
 
-async function refreshProbeRunsList() {
-  const sel = $("probe_runs_select");
-  if (!sel) return;
-  try {
-    const r = await fetch("/api/probe/runs");
-    if (!r.ok) return;
-    const data = await r.json();
-    const prev = sel.value;
-    sel.innerHTML = '<option value="">— select —</option>';
-    for (const key of Object.keys(probeRunsByFilename)) delete probeRunsByFilename[key];
-    for (const run of (data.runs || [])) {
-      probeRunsByFilename[run.filename] = run;
-      const opt = document.createElement("option");
-      opt.value = run.filename;
-      const date = _formatLocalTimestamp(run.mtime_unix);
-      opt.textContent = `${date}  ${run.axis}${run.dir} ${run.n_touches}×  (${run.filename})`;
-      sel.appendChild(opt);
-    }
-    sel.value = prev;
-    _renderProbeRunMeta(sel.value);
-  } catch (_) { /* next refresh handles it */ }
-}
+const refreshProbeRunsList = makeRunsRefresher({
+  selectId: "probe_runs_select",
+  listUrl: "/api/probe/runs",
+  store: probeRunsByFilename,
+  formatOption: (run, date) =>
+    `${date}  ${run.axis}${run.dir} ${run.n_touches}×  (${run.filename})`,
+  renderMeta: _renderProbeRunMeta,
+});
 
-async function loadProbeReplay(filename) {
-  if (!filename) { loadedProbeReplayFilename = null; return; }
-  try {
-    const r = await fetch(
-      `/api/probe/runs/${encodeURIComponent(filename)}/analyse`, { method: "POST" });
-    if (!r.ok) { alert("Replay failed: " + (await r.text())); return; }
-    const data = await r.json();
+const loadProbeReplay = makeReplayLoader({
+  analyseUrl: (filename) =>
+    `/api/probe/runs/${encodeURIComponent(filename)}/analyse`,
+  onClear: () => { loadedProbeReplayFilename = null; },
+  onLoaded: (filename, data) => {
     loadedProbeReplayFilename = filename;
     lastProbeData = { analysis: data.analysis };
     renderProbeResults(data.analysis);
-  } catch (e) {
-    alert("Replay error: " + e);
-  }
-}
+  },
+});
 
 // ---- websocket ----
 function openWs() {
@@ -2067,43 +2112,25 @@ function _formatLocalTimestamp(unixSec) {
   );
 }
 
-function _renderRunMeta(filename) {
-  const el = $("run_meta");
-  if (!el) return;
-  const run = runsByFilename[filename];
-  if (!run) {
-    el.textContent = "";
-    return;
-  }
-  const parts = [];
-  if (run.filament_label) parts.push(run.filament_label);
-  if (run.nozzle_temp > 0) parts.push(`${run.nozzle_temp.toFixed(0)} °C`);
-  el.textContent = parts.join("  @  ");
-}
+const _renderRunMeta = makeRunMetaRenderer({
+  metaElId: "run_meta",
+  store: runsByFilename,
+  formatMeta: (run) => {
+    const parts = [];
+    if (run.filament_label) parts.push(run.filament_label);
+    if (run.nozzle_temp > 0) parts.push(`${run.nozzle_temp.toFixed(0)} °C`);
+    return parts.join("  @  ");
+  },
+});
 
-async function refreshRunsList() {
-  const sel = $("runs_select");
-  if (!sel) return;
-  try {
-    const r = await fetch("/api/runs");
-    if (!r.ok) return;
-    const data = await r.json();
-    const prev = sel.value;
-    sel.innerHTML = '<option value="">— select —</option>';
-    // Reset and re-fill the lookup table.
-    for (const key of Object.keys(runsByFilename)) delete runsByFilename[key];
-    for (const run of (data.runs || [])) {
-      runsByFilename[run.filename] = run;
-      const opt = document.createElement("option");
-      opt.value = run.filename;
-      const date = _formatLocalTimestamp(run.mtime_unix);
-      opt.textContent = `${date}  ${run.n_K}K × ${run.cycles_per_K}cyc  (${run.filename})`;
-      sel.appendChild(opt);
-    }
-    sel.value = prev;
-    _renderRunMeta(sel.value);
-  } catch (_) { /* network hiccup -- next refresh handles it */ }
-}
+const refreshRunsList = makeRunsRefresher({
+  selectId: "runs_select",
+  listUrl: "/api/runs",
+  store: runsByFilename,
+  formatOption: (run, date) =>
+    `${date}  ${run.n_K}K × ${run.cycles_per_K}cyc  (${run.filename})`,
+  renderMeta: _renderRunMeta,
+});
 
 // Tracks which saved npz is currently rendered (null = live run / nothing).
 // The annotation card needs this to know which file POST /annotate targets.
@@ -3053,28 +3080,17 @@ function renderLiveMapRun(run) {
 // ---- review (saved runs) ----
 const lmRunsByFilename = {};
 
-async function refreshLiveMapRuns() {
-  const sel = $("lm_runs_select");
-  if (!sel) return;
-  try {
-    const r = await fetch("/api/livemap/runs");
-    if (!r.ok) return;
-    const data = await r.json();
-    const prev = sel.value;
-    sel.innerHTML = '<option value="">— select —</option>';
-    for (const k of Object.keys(lmRunsByFilename)) delete lmRunsByFilename[k];
-    for (const run of (data.runs || [])) {
-      lmRunsByFilename[run.filename] = run;
-      const opt = document.createElement("option");
-      opt.value = run.filename;
-      const date = _formatLocalTimestamp(run.mtime_unix);
-      const nm = run.gcode_name ? ` ${run.gcode_name}` : "";
-      opt.textContent = `${date}${nm}  ${run.n_layers} layers  (${run.filename})`;
-      sel.appendChild(opt);
-    }
-    sel.value = prev;
-  } catch (_) { /* next refresh handles it */ }
-}
+const refreshLiveMapRuns = makeRunsRefresher({
+  selectId: "lm_runs_select",
+  listUrl: "/api/livemap/runs",
+  store: lmRunsByFilename,
+  formatOption: (run, date) => {
+    const nm = run.gcode_name ? ` ${run.gcode_name}` : "";
+    return `${date}${nm}  ${run.n_layers} layers  (${run.filename})`;
+  },
+  // No meta line under the Live Map dropdown; loadLiveMapReview fills
+  // lm_run_meta itself when a run is opened.
+});
 
 async function loadLiveMapReview(filename) {
   $("lm_run_meta").textContent = "";
@@ -3110,30 +3126,17 @@ document.addEventListener("DOMContentLoaded", () => {
   };
   refreshRunsList();
 
-  // XLSX export. The dropdown button exports whatever saved run is
-  // selected (no need to load it first); the results-card button exports
-  // whatever the page is currently showing -- a loaded replay if there is
-  // one, otherwise the just-finished live run held in server memory.
-  const btnExportRun = $("btn_export_run");
-  if (btnExportRun) btnExportRun.onclick = () => {
-    const fn = $("runs_select").value;
-    if (!fn) { alert("Select a saved run from the dropdown first."); return; }
-    downloadXlsx(
-      `/api/runs/${encodeURIComponent(fn)}/export.xlsx`,
-      fn.replace(/\.npz$/, ".xlsx"),
-    );
-  };
-  const btnExportCurrent = $("btn_export_current");
-  if (btnExportCurrent) btnExportCurrent.onclick = () => {
-    if (loadedReplayFilename) {
-      downloadXlsx(
-        `/api/runs/${encodeURIComponent(loadedReplayFilename)}/export.xlsx`,
-        loadedReplayFilename.replace(/\.npz$/, ".xlsx"),
-      );
-    } else {
-      downloadXlsx("/api/current_run/export.xlsx", "current_run.xlsx");
-    }
-  };
+  // XLSX export (see wireExportButtons for the selected/current split).
+  wireExportButtons({
+    selectedBtnId: "btn_export_run",
+    currentBtnId: "btn_export_current",
+    selectId: "runs_select",
+    noneSelectedMsg: "Select a saved run from the dropdown first.",
+    exportUrl: (fn) => `/api/runs/${encodeURIComponent(fn)}/export.xlsx`,
+    getLoadedReplay: () => loadedReplayFilename,
+    currentUrl: "/api/current_run/export.xlsx",
+    currentName: "current_run.xlsx",
+  });
 
   // ---- Max Flow test ----
   $("mode_pa").onclick = () => setMode("pa");
@@ -3166,13 +3169,13 @@ document.addEventListener("DOMContentLoaded", () => {
   };
   $("lm_runs_refresh").onclick = refreshLiveMapRuns;
   $("lm_runs_select").onchange = (ev) => loadLiveMapReview(ev.target.value);
-  const lmExport = $("lm_export");
-  if (lmExport) lmExport.onclick = () => {
-    const fn = $("lm_runs_select").value;
-    if (!fn) { alert("Select a saved Live Map run from the dropdown first."); return; }
-    downloadXlsx(`/api/livemap/runs/${encodeURIComponent(fn)}/export.xlsx`,
-      fn.replace(/\.npz$/, ".xlsx"));
-  };
+  // Live Map has only a "selected run" export (no current-run button).
+  wireExportButtons({
+    selectedBtnId: "lm_export",
+    selectId: "lm_runs_select",
+    noneSelectedMsg: "Select a saved Live Map run from the dropdown first.",
+    exportUrl: (fn) => `/api/livemap/runs/${encodeURIComponent(fn)}/export.xlsx`,
+  });
   refreshLiveMapRuns();
   setInterval(lmapTick, 200);
   $("btn_flow_save").onclick = saveConfig;
@@ -3185,24 +3188,16 @@ document.addEventListener("DOMContentLoaded", () => {
     _renderFlowRunMeta(ev.target.value);
     loadFlowReplay(ev.target.value);
   };
-  const btnFlowExportRun = $("btn_flow_export_run");
-  if (btnFlowExportRun) btnFlowExportRun.onclick = () => {
-    const fn = $("flow_runs_select").value;
-    if (!fn) { alert("Select a saved flow run from the dropdown first."); return; }
-    downloadXlsx(
-      `/api/flow/runs/${encodeURIComponent(fn)}/export.xlsx`,
-      fn.replace(/\.npz$/, ".xlsx"));
-  };
-  const btnFlowExportCurrent = $("btn_flow_export_current");
-  if (btnFlowExportCurrent) btnFlowExportCurrent.onclick = () => {
-    if (loadedFlowReplayFilename) {
-      downloadXlsx(
-        `/api/flow/runs/${encodeURIComponent(loadedFlowReplayFilename)}/export.xlsx`,
-        loadedFlowReplayFilename.replace(/\.npz$/, ".xlsx"));
-    } else {
-      downloadXlsx("/api/flow/current_run/export.xlsx", "flow_run.xlsx");
-    }
-  };
+  wireExportButtons({
+    selectedBtnId: "btn_flow_export_run",
+    currentBtnId: "btn_flow_export_current",
+    selectId: "flow_runs_select",
+    noneSelectedMsg: "Select a saved flow run from the dropdown first.",
+    exportUrl: (fn) => `/api/flow/runs/${encodeURIComponent(fn)}/export.xlsx`,
+    getLoadedReplay: () => loadedFlowReplayFilename,
+    currentUrl: "/api/flow/current_run/export.xlsx",
+    currentName: "flow_run.xlsx",
+  });
   $("flow_prev").onclick = () => flowStep(-1);
   $("flow_next").onclick = () => flowStep(1);
   refreshFlowRunsList();
@@ -3217,24 +3212,16 @@ document.addEventListener("DOMContentLoaded", () => {
     _renderProbeRunMeta(ev.target.value);
     loadProbeReplay(ev.target.value);
   };
-  const btnProbeExportRun = $("btn_probe_export_run");
-  if (btnProbeExportRun) btnProbeExportRun.onclick = () => {
-    const fn = $("probe_runs_select").value;
-    if (!fn) { alert("Select a saved probe run from the dropdown first."); return; }
-    downloadXlsx(
-      `/api/probe/runs/${encodeURIComponent(fn)}/export.xlsx`,
-      fn.replace(/\.npz$/, ".xlsx"));
-  };
-  const btnProbeExportCurrent = $("btn_probe_export_current");
-  if (btnProbeExportCurrent) btnProbeExportCurrent.onclick = () => {
-    if (loadedProbeReplayFilename) {
-      downloadXlsx(
-        `/api/probe/runs/${encodeURIComponent(loadedProbeReplayFilename)}/export.xlsx`,
-        loadedProbeReplayFilename.replace(/\.npz$/, ".xlsx"));
-    } else {
-      downloadXlsx("/api/probe/current_run/export.xlsx", "probe_run.xlsx");
-    }
-  };
+  wireExportButtons({
+    selectedBtnId: "btn_probe_export_run",
+    currentBtnId: "btn_probe_export_current",
+    selectId: "probe_runs_select",
+    noneSelectedMsg: "Select a saved probe run from the dropdown first.",
+    exportUrl: (fn) => `/api/probe/runs/${encodeURIComponent(fn)}/export.xlsx`,
+    getLoadedReplay: () => loadedProbeReplayFilename,
+    currentUrl: "/api/probe/current_run/export.xlsx",
+    currentName: "probe_run.xlsx",
+  });
   $("probe_prev").onclick = () => probeStep(-1);
   $("probe_next").onclick = () => probeStep(1);
   refreshProbeRunsList();
