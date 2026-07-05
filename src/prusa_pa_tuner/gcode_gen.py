@@ -160,7 +160,16 @@ class SweepParams:
     # The slow leg moves the toolhead from (x_base, y_base, z_base) by
     # +(dx, dy, dz); the fast leg returns it. Zero net drift per cycle,
     # zero net drift across the whole sweep.
-    coupled_dx_mm: float = 0.05
+    #
+    # Amplitude: 0.4 mm (was 0.05). Buddy reports pos_x quantized to
+    # ~0.05-0.1 mm at ~56 Hz, so a 0.05 mm oscillation sits AT the
+    # sensor's resolution floor and the transition detector operated
+    # with zero margin (observed: missed cycles + false positives on
+    # real runs). 0.4 mm gives 4-8 quantization steps per leg while the
+    # toolhead speed stays trivial (0.4 mm over a 1 s slow leg =
+    # 0.4 mm/s), so XY inertial coupling into the loadcell remains
+    # negligible.
+    coupled_dx_mm: float = 0.4
     coupled_dy_mm: float = 0.0
     coupled_dz_mm: float = 0.0
 
@@ -171,9 +180,14 @@ class SweepParams:
     # Replaces the legacy fixed-2mm prime + 500 ms dwell -- with
     # factor=10 and slow_half=2 s this gives 20 s of slow flow
     # (~25 mm at 1.25 mm/s) which fully establishes pressure before
-    # the first slow→fast transition. Set to 1 to disable extension
-    # (back-compat). All subsequent slow legs (including K[0]'s
-    # cycles 1..N) are unaffected.
+    # the first slow→fast transition. All subsequent slow legs
+    # (including K[0]'s cycles 1..N) are unaffected.
+    #
+    # NOTE: the dataclass default is the NEUTRAL 1.0 (no extension) so
+    # directly-constructed SweepParams -- tests, scripts -- get a plain
+    # square wave. The user-facing default lives in AppConfig
+    # (first_slow_leg_factor = 10.0) and flows in via
+    # runner.params_from_config; live runs therefore always warm up.
     first_slow_leg_factor: float = 1.0
 
     # Pre-burst Z-marker pulse magnitude. The gcode generator lifts the

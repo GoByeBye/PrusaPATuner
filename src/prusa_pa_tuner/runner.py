@@ -678,8 +678,18 @@ async def run_tuning(
             loss = stream.loss_events()
             loss_t = np.array([t for t, _ in loss], dtype=float)
             loss_n = np.array([n for _, n in loss], dtype=float)
+            # Full SweepParams as JSON. Replay reconstructs the plan
+            # from THIS, byte-for-byte, instead of guessing missing
+            # knobs from heuristics (the _derive_coupled_dx_mm
+            # percentile fallback misfired on runs with park motion).
+            # The individual scalar fields below stay for backward
+            # compatibility with older readers.
+            import dataclasses as _dc
+            import json as _json
+            params_json = _json.dumps(_dc.asdict(plan.params))
             np.savez(
                 dump_path,
+                sweep_params_json=np.array([params_json], dtype="U8192"),
                 force_t=force_t,
                 force_y=force_y,
                 loss_t=loss_t,

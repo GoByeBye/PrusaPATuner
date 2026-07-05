@@ -7,13 +7,14 @@ Used by:
     `POST /api/runs/<filename>/analyse`), which routes through the
     same code so the rendered view matches a live sweep exactly.
 
-The npz dump only stores per-cycle timing knobs (slow/fast halves,
-cycle count, K values) — not the full SweepParams. We reconstruct a
-minimal SweepParams that's sufficient for `analyse_sweep`. Notably
-`coupled_dx_mm` is NOT in the dump; we derive an effective amplitude
-from the actual pos_x swing inside the burst region, so the
-pos_x transition detector picks up real motion even when the run used
-a non-default coupling.
+Since 2026-07 the npz dump stores the FULL SweepParams as JSON
+(`sweep_params_json`), so replay rebuilds the exact plan the run used.
+Older dumps only carried per-cycle timing knobs (slow/fast halves,
+cycle count, K values); for those we reconstruct a minimal SweepParams
+and, when `coupled_dx_mm` is missing, derive an effective amplitude
+from the actual pos_x swing inside the burst region so the pos_x
+transition detector picks up real motion even when the run used a
+non-default coupling.
 """
 from __future__ import annotations
 
@@ -143,6 +144,30 @@ def list_runs(runs_dir: str | os.PathLike = "runs") -> list[RunInfo]:
     return out
 
 
+def _params_from_json(d: Any) -> SweepParams | None:
+    """Rebuild SweepParams from the `sweep_params_json` NPZ field.
+
+    Returns None when the field is absent (legacy dump) or unparseable.
+    Unknown keys in the JSON (from a future SweepParams revision) are
+    dropped; missing keys fall back to the dataclass defaults."""
+    if "sweep_params_json" not in d or not len(d["sweep_params_json"]):
+        return None
+    try:
+        import dataclasses
+        import json
+
+        raw = json.loads(str(d["sweep_params_json"][0]))
+        if not isinstance(raw, dict):
+            return None
+        known = {f.name for f in dataclasses.fields(SweepParams)}
+        kwargs = {k: v for k, v in raw.items() if k in known}
+        if "K_values" in kwargs:
+            kwargs["K_values"] = tuple(float(k) for k in kwargs["K_values"])
+        return SweepParams(**kwargs)
+    except Exception:
+        return None
+
+
 def _derive_coupled_dx_mm(pos_x: np.ndarray) -> float:
     """Best-effort estimate of `coupled_dx_mm` from the recorded pos_x.
 
@@ -194,51 +219,42 @@ def load_run(path: str | os.PathLike) -> tuple[SweepPlan, dict[str, Any]]:
     consume it but the dataclass needs it populated.
     """
     d = np.load(path, allow_pickle=True)
-    cycles = int(d["cycles_per_K"][0])
-    slow_h = float(d["slow_half_s"][0])
-    fast_h = float(d["fast_half_s"][0])
-    slow_v = float(d["slow_feed_mm_s"][0])
-    fast_v = float(d["fast_feed_mm_s"][0])
-    k_values = tuple(float(k) for k in d["k_values"])
     pos_x = d["pos_x"] if "pos_x" in d and len(d["pos_x"]) else np.array([])
-    # Newer NPZs store the full sweep-shape config; older ones don't.
-    # When `first_slow_leg_factor` is missing we INFER it from the data
-    # so the analyser's plan model matches the actual run (otherwise
-    # the pos_x-transition slicer's K[0] warm-up detection runs against
-    # a plan that says 11 s when the data says 21 s, or vice versa).
-    def _get(key: str, default: float) -> float:
-        return float(d[key][0]) if key in d and len(d[key]) else default
 
-    first_slow_leg_factor = _get("first_slow_leg_factor", 10.0)
-    coupled_dx_mm_saved = _get("coupled_dx_mm", -1.0)
-    coupled_dx_mm = (
-        coupled_dx_mm_saved
-        if coupled_dx_mm_saved > 0
-        else _derive_coupled_dx_mm(pos_x)
-    )
-    coupled_dy_mm = _get("coupled_dy_mm", 0.0)
-    coupled_dz_mm = _get("coupled_dz_mm", 0.0)
-    purge_x = _get("purge_x", 30.0)
-    purge_y = _get("purge_y", 30.0)
-    purge_z = _get("purge_z", 50.0)
-    z_marker_lift_mm = _get("z_marker_lift_mm", 2.0)
+    # PREFERRED: the full SweepParams JSON that the runner dumps since
+    # 2026-07. Replay then rebuilds the plan from the exact parameters
+    # the run used -- no defaults, no heuristics.
+    params = _params_from_json(d)
+    if params is None:
+        # Legacy NPZs: reconstruct from the individual scalar fields,
+        # with fallback defaults for knobs older dumps didn't store.
+        # When `coupled_dx_mm` is missing we INFER it from the data so
+        # the pos_x transition detector gets a sane deadband.
+        def _get(key: str, default: float) -> float:
+            return float(d[key][0]) if key in d and len(d[key]) else default
 
-    params = SweepParams(
-        K_values=k_values,
-        cycles_per_K=cycles,
-        slow_half_s=slow_h,
-        fast_half_s=fast_h,
-        slow_feed_mm_s=slow_v,
-        fast_feed_mm_s=fast_v,
-        coupled_dx_mm=coupled_dx_mm,
-        coupled_dy_mm=coupled_dy_mm,
-        coupled_dz_mm=coupled_dz_mm,
-        first_slow_leg_factor=first_slow_leg_factor,
-        purge_x=purge_x,
-        purge_y=purge_y,
-        purge_z=purge_z,
-        z_marker_lift_mm=z_marker_lift_mm,
-    )
+        coupled_dx_mm_saved = _get("coupled_dx_mm", -1.0)
+        params = SweepParams(
+            K_values=tuple(float(k) for k in d["k_values"]),
+            cycles_per_K=int(d["cycles_per_K"][0]),
+            slow_half_s=float(d["slow_half_s"][0]),
+            fast_half_s=float(d["fast_half_s"][0]),
+            slow_feed_mm_s=float(d["slow_feed_mm_s"][0]),
+            fast_feed_mm_s=float(d["fast_feed_mm_s"][0]),
+            coupled_dx_mm=(
+                coupled_dx_mm_saved
+                if coupled_dx_mm_saved > 0
+                else _derive_coupled_dx_mm(pos_x)
+            ),
+            coupled_dy_mm=_get("coupled_dy_mm", 0.0),
+            coupled_dz_mm=_get("coupled_dz_mm", 0.0),
+            first_slow_leg_factor=_get("first_slow_leg_factor", 10.0),
+            purge_x=_get("purge_x", 30.0),
+            purge_y=_get("purge_y", 30.0),
+            purge_z=_get("purge_z", 50.0),
+            z_marker_lift_mm=_get("z_marker_lift_mm", 2.0),
+        )
+    z_marker_lift_mm = params.z_marker_lift_mm
     plan = build_sweep(params)
 
     pos_t = d["pos_t"] if "pos_t" in d and len(d["pos_t"]) else None

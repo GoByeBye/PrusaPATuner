@@ -82,7 +82,10 @@ class AppConfig:
     # on its own stepper, decoupled from the A/B/CoreXY pair). dz is
     # exposed so the user can experiment with what couples least into the
     # loadcell signal.
-    coupled_dx_mm: float = 0.05
+    # 0.4 mm default (was 0.05): pos_x is quantized to ~0.05-0.1 mm, so
+    # the old amplitude sat at the sensor floor and cycle-transition
+    # detection had no margin. See SweepParams.coupled_dx_mm.
+    coupled_dx_mm: float = 0.4
     coupled_dy_mm: float = 0.0
     coupled_dz_mm: float = 0.0
     # First slow-leg warm-up factor. K[0]'s very first slow extrusion
