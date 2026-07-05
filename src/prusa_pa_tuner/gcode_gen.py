@@ -34,6 +34,45 @@ import math
 from dataclasses import dataclass, field
 from typing import Iterable
 
+# Metrics to disable (M332) before enabling the few streams we consume.
+# These names match what THIS firmware build emits (verified via
+# /api/diagnostics on the user's printer). Buddy's `M332 <name>` is a
+# strict case-sensitive strcmp -- it silently no-ops on miss and the
+# reply goes only to serial, which PrusaLink discards. So this list is
+# curated against observed live names; do NOT add speculative names.
+# Shared by build_sweep (PA tuning) and flow_gen.build_flow_ramp (max
+# flow) so the two test gcodes bring the printer to the same minimal,
+# low-UDP-load state.
+METRICS_TO_SILENCE: tuple[str, ...] = (
+    # Default-on noisy stuff we observed at runtime.
+    "cmdcnt", "stp_stall",
+    "runtime", "stack",
+    "fan", "input_current", "heater_current",
+    "oc_inp", "oc_nozz",
+    "bed_voltage", "heater_voltage",
+    "door_sensor", "chamber_temp",
+    "points_dropped", "cur_mmu_imp",
+    "esp_in", "esp_out", "eth_out",
+    "heater_enabled",
+    # Loadcell variants we don't use (loadcell_value is the primary).
+    # `loadcell` is the processed/grams stream; we consume the raw
+    # `loadcell_value` instead, so silence `loadcell` to save bandwidth.
+    # NOTE: M332 is an EXACT case-sensitive match, so "loadcell" does NOT
+    # touch "loadcell_value" -- the primary stream stays enabled.
+    "loadcell",
+    "loadcell_hysteresis",
+    "loadcell_threshold", "loadcell_threshold_cont",
+    # Gcode-queue telemetry -- not text echoes, just queue state.
+    "gcd_que_sz", "ftch_cmds", "ftch_dur", "ftch_occ",
+    "ftch_status", "ftch_tstatus",
+    # Printer state we don't need.
+    "is_printing", "home", "home_diff",
+    "phxy_home", "phxy_meas", "phxy_probe",
+    "fw_version", "buddy_bom", "filament",
+    "classified", "detection",
+    "metrics", "hit:", "opened:",
+)
+
 
 @dataclass(slots=True)
 class SweepParams:
@@ -257,30 +296,7 @@ def build_sweep(params: SweepParams) -> SweepPlan:
     # "Metric not found" reply goes only to serial, which PrusaLink throws
     # away. So this list is curated against observed live names; do NOT
     # add speculative names (they'd just be filler).
-    metrics_to_silence = (
-        # Default-on noisy stuff we observed at runtime.
-        "cmdcnt", "stp_stall",
-        "runtime", "stack",
-        "fan", "input_current", "heater_current",
-        "oc_inp", "oc_nozz",
-        "bed_voltage", "heater_voltage",
-        "door_sensor", "chamber_temp",
-        "points_dropped", "cur_mmu_imp",
-        "esp_in", "esp_out", "eth_out",
-        "heater_enabled",
-        # Loadcell variants we don't use (loadcell_value is the primary).
-        "loadcell_hysteresis",
-        "loadcell_threshold", "loadcell_threshold_cont",
-        # Gcode-queue telemetry -- not text echoes, just queue state.
-        "gcd_que_sz", "ftch_cmds", "ftch_dur", "ftch_occ",
-        "ftch_status", "ftch_tstatus",
-        # Printer state we don't need.
-        "is_printing", "home", "home_diff",
-        "phxy_home", "phxy_meas", "phxy_probe",
-        "fw_version", "buddy_bom", "filament",
-        "classified", "detection",
-        "metrics", "hit:", "opened:",
-    )
+    metrics_to_silence = METRICS_TO_SILENCE
     lines.append("; --- silence non-essential metrics to lower UDP load ---")
     for m in metrics_to_silence:
         lines.append(f"M332 {m}")

@@ -158,6 +158,7 @@ BD_METRIC_NAMES: tuple[str, ...] = (
     "baseline_noise_std",
     "rise_delay",
     "rise_error_area",
+    "rise_signed_area",
     "rise_slope",
     "overshoot",
     "high_level",
@@ -165,6 +166,7 @@ BD_METRIC_NAMES: tuple[str, ...] = (
     "plateau_creep",
     "fall_delay",
     "fall_error_area",
+    "fall_signed_area",
     "undershoot",
     "tail_area",
     "settling_time",
@@ -320,6 +322,14 @@ class SweepAnalysis:
     bd_segments: list[BdSegment] = field(default_factory=list)
     bd_per_k: list[BdKResult] = field(default_factory=list)
     bd_k_opt: float | None = None
+    # Signed-area zero-crossing estimators (overshoot↔lag discriminator).
+    # Fit the per-K median of {rise,fall}_signed_area vs K and solve for
+    # area = 0. Independent of the composite-cost argmin (`bd_k_opt`) — a
+    # cross-check that exploits the SIGN of the step-response asymmetry
+    # rather than its magnitude. `bd_signed_fall_fit` is the cleaner of the
+    # two (no rise-transient bias); see the per-segment metric notes.
+    bd_signed_rise_fit: FitResult | None = None
+    bd_signed_fall_fit: FitResult | None = None
     bd_default_weights: dict[str, float] = field(
         default_factory=lambda: dict(BD_DEFAULT_WEIGHTS)
     )
@@ -1278,6 +1288,20 @@ def _bd_segment_metrics(
             rw_y = y_tared[rise_window_mask]
             err = np.abs(high_level_tared - rw_y)
             metrics["rise_error_area"] = float(np.trapezoid(err, rw_t))
+            # Signed twin of rise_error_area: ∫(force − high_level) over
+            # the SAME window. The abs version only has a VALLEY at K_opt
+            # (you must argmin it); the signed integral CROSSES ZERO at
+            # K_opt, so its sign tells you which side you're on:
+            #   force above the plateau (overshoot spike) → POSITIVE → over-PA
+            #   force below the plateau (still ramping/lag) → NEGATIVE → under-PA
+            # Caveat vs the fall twin: this window opens at t_rise, so even
+            # at K_opt the unavoidable rise transient contributes a small
+            # negative (sub-plateau) bias — its zero-crossing sits a touch
+            # high. fall_signed_area (target = baseline) has no such bias and
+            # is the preferred zero-crossing estimator.
+            metrics["rise_signed_area"] = float(
+                np.trapezoid(rw_y - high_level_tared, rw_t)
+            )
 
     # R7 trough (undershoot location): min within [t_fall_start (or
     # t_fall), t_fall_end + 30% of slow_half]. Mirrors R3's bounding:
@@ -1312,6 +1336,16 @@ def _bd_segment_metrics(
         fw_y = y_tared[fall_window_mask]
         err = np.abs(fw_y)
         metrics["fall_error_area"] = float(np.trapezoid(err, fw_t))
+        # Signed twin of fall_error_area: ∫(force − baseline) over the SAME
+        # window (baseline = tared 0). The fall target IS the baseline, so
+        # unlike the rise window there's no built-in transient deficit — the
+        # integral is a clean zero-crossing discriminator:
+        #   force lingers ABOVE baseline (slow pressure bleed / drool tail)
+        #     → POSITIVE → under-PA (K too low)
+        #   force dips BELOW baseline (retraction-like undershoot dip)
+        #     → NEGATIVE → over-PA (K too high)
+        # This is the metric backing bd_signed_fall_fit's K_opt.
+        metrics["fall_signed_area"] = float(np.trapezoid(fw_y, fw_t))
 
     # R7 undershoot: how far the trough sits below the baseline (tared
     # zero). max(0, …) so undershoot stays non-negative.
@@ -3810,6 +3844,34 @@ def analyse_sweep(
     else:
         bd_k_opt = None
 
+    # Signed-area zero-crossing fits. Reuse the SAME per-K quality mask as
+    # bd_k_opt so all three estimators agree on which K values are usable.
+    # rise_signed_area = ∫(force − plateau); fall_signed_area =
+    # ∫(force − baseline). Under-PA leaves the rise below the plateau (−)
+    # and the fall draining above baseline (+); over-PA overshoots the
+    # plateau (+) and undershoots the baseline (−). Fit the per-K MEDIAN
+    # and solve for the zero crossing. The fall fit is the cleaner
+    # estimator (target = baseline → no rise-transient deficit); the rise
+    # fit ships as an independent cross-check.
+    bd_signed_rise_fit: FitResult | None = None
+    bd_signed_fall_fit: FitResult | None = None
+    if bd_quality_mask.any():
+        ks_signed = np.asarray([r.k for r in bd_per_k], dtype=float)[bd_quality_mask]
+        rise_signed = np.asarray(
+            [r.medians.get("rise_signed_area", float("nan")) for r in bd_per_k],
+            dtype=float,
+        )[bd_quality_mask]
+        fall_signed = np.asarray(
+            [r.medians.get("fall_signed_area", float("nan")) for r in bd_per_k],
+            dtype=float,
+        )[bd_quality_mask]
+        bd_signed_rise_fit = _linear_fit_zero_crossing(
+            ks_signed, rise_signed, "signed_rise_area"
+        )
+        bd_signed_fall_fit = _linear_fit_zero_crossing(
+            ks_signed, fall_signed, "signed_fall_area"
+        )
+
     if phase_fit is None:
         notes.append("Phase-lag fit failed — insufficient data or zero slope.")
     if integral_fit is None:
@@ -3817,6 +3879,12 @@ def analyse_sweep(
     if bd_k_opt is None:
         notes.append(
             "bd_pressure K_opt fit failed — no K passed the segment-quality gate."
+        )
+    if bd_signed_fall_fit is not None:
+        notes.append(
+            "signed fall-area: +area=drool/under-PA, −area=undershoot/over-PA; "
+            "optimum is the measured zero crossing (UI), linear-fit trend "
+            f"R²={bd_signed_fall_fit.r_squared:.2f}"
         )
     if in_rate < 100:
         notes.append(f"Incoming sample rate is only {in_rate:.0f} Hz — analysis may be noisy.")
@@ -3848,5 +3916,7 @@ def analyse_sweep(
         bd_segments=bd_segments,
         bd_per_k=bd_per_k,
         bd_k_opt=bd_k_opt,
+        bd_signed_rise_fit=bd_signed_rise_fit,
+        bd_signed_fall_fit=bd_signed_fall_fit,
         bd_default_weights=dict(BD_DEFAULT_WEIGHTS),
     )

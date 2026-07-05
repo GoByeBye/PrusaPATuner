@@ -4,20 +4,63 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    File,
+    HTTPException,
+    Response,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import __version__
 from .config import AppConfig, load_config, save_config
+from .export import _XLSX_MEDIA_TYPE, build_force_xlsx, saved_run_to_xlsx
+from .flow_analysis import flow_analysis_to_dict
+from .flow_gen import build_flow_ramp
+from .flow_runner import (
+    FlowRun,
+    flow_params_from_config,
+    list_flow_runs,
+    replay_flow,
+    run_flow_test,
+)
 from .gcode_gen import build_sweep
+from .gcode_parse import ParsedGcode, layer_polylines, parse_gcode
+from .livemap_map import MappedRun, layer_detail, mapped_summary
+from .livemap_runner import (
+    LiveMapRun,
+    list_livemap_runs,
+    replay_livemap,
+    run_live_map,
+)
 from .netutil import local_ip_toward
-from .replay import list_runs, replay
+from .optimiser import (
+    OPTIMISABLE_METRICS,
+    discover_annotated_runs,
+    optimise_weights,
+    result_to_dict,
+    write_weights_json,
+)
+from .probe_analysis import probe_analysis_to_dict
+from .probe_gen import build_probe_test
+from .probe_runner import (
+    ProbeRun,
+    list_probe_runs,
+    probe_params_from_config,
+    replay_probe,
+    run_probe_test,
+)
+from .replay import annotate_run, list_runs, read_annotation, replay
 from .runner import TuningRun, _analysis_to_dict, params_from_config, run_tuning
 from .udp_metrics import MetricStream
 
@@ -31,12 +74,34 @@ class AppState:
     stream: MetricStream
     current_run: TuningRun | None = None
     run_task: asyncio.Task | None = None
+    # Max Flow test run (separate from the PA tuning run; only one of the
+    # two may run at a time since they share the single loadcell stream).
+    flow_run: FlowRun | None = None
+    flow_run_task: asyncio.Task | None = None
+    # Live Map run + the uploaded-but-not-yet-run gcode ("pending") + the
+    # saved run currently opened for review (cached so per-layer paging
+    # doesn't re-map every request). All three loadcell consumers
+    # (PA / flow / livemap) are mutually exclusive -- one stream.
+    livemap_run: LiveMapRun | None = None
+    livemap_run_task: asyncio.Task | None = None
+    livemap_pending: dict[str, Any] | None = None  # {name, gcode, parsed}
+    livemap_review: dict[str, Any] | None = None    # {filename, mapped}
+    # Touch-probe lateral characterisation run. Shares the single loadcell
+    # stream with the other three modes -- mutually exclusive.
+    probe_run: ProbeRun | None = None
+    probe_run_task: asyncio.Task | None = None
     ws_clients: set[WebSocket]
+    # Background optimiser jobs keyed by job_id. Each entry is a dict
+    # the polling endpoint returns directly; updated in-place by the
+    # progress callback (single-key writes are atomic enough for our
+    # producer/consumer pattern across the thread boundary).
+    optimise_jobs: dict[str, dict[str, Any]]
 
     def __init__(self):
         self.cfg = load_config()
         self.stream = MetricStream(port=self.cfg.udp_port)
         self.ws_clients = set()
+        self.optimise_jobs = {}
 
 
 state = AppState()
@@ -90,6 +155,29 @@ class ConfigModel(BaseModel):
     coupled_dz_mm: float = Field(0.0, ge=0)
     first_slow_leg_factor: float = Field(10.0, ge=1)
     filament_label: str = "PLA"
+
+    # --- Max Flow test ---
+    flow_min_mm3_s: float = Field(5.0, gt=0)
+    flow_max_mm3_s: float = Field(30.0, gt=0)
+    flow_step_mm3_s: float = Field(1.0, gt=0)
+    flow_dwell_s: float = Field(3.0, gt=0)
+    flow_settle_frac: float = Field(0.5, ge=0, lt=1)
+    flow_warmup_s: float = Field(3.0, ge=0)
+    flow_tare_dwell_s: float = Field(1.5, ge=0)
+
+    # --- Touch probe (lateral characterisation) ---
+    probe_axis: str = "X"
+    probe_dir: str = "+"
+    probe_start_x: float = 125.0
+    probe_start_y: float = 110.0
+    probe_z: float = Field(5.0, ge=0)
+    probe_creep_mm: float = Field(1.0, gt=0, le=20)
+    probe_slow_feed_mm_min: float = Field(30.0, gt=0)
+    probe_travel_feed_mm_min: float = Field(3000.0, gt=0)
+    probe_n_touches: int = Field(5, ge=1, le=50)
+    probe_backoff_mm: float = Field(1.0, ge=0)
+    probe_settle_ms: int = Field(300, ge=0, le=10000)
+    probe_temp: float = Field(0.0, ge=0)
 
     @classmethod
     def from_appconfig(cls, c: AppConfig) -> "ConfigModel":
@@ -159,6 +247,12 @@ async def get_preview():
 async def post_run():
     if state.run_task is not None and not state.run_task.done():
         raise HTTPException(409, "A run is already in progress")
+    if state.flow_run_task is not None and not state.flow_run_task.done():
+        raise HTTPException(409, "A Max Flow run is in progress; wait for it to finish")
+    if state.livemap_run_task is not None and not state.livemap_run_task.done():
+        raise HTTPException(409, "A Live Map run is in progress; wait for it to finish")
+    if state.probe_run_task is not None and not state.probe_run_task.done():
+        raise HTTPException(409, "A Touch Probe run is in progress; wait for it to finish")
     if not state.cfg.printer_host:
         raise HTTPException(400, "printer_host must be configured")
     if not (state.cfg.printer_api_key or state.cfg.printer_password):
@@ -207,10 +301,29 @@ async def get_runs():
                 "duration_s": r.duration_s,
                 "filament_label": r.filament_label,
                 "nozzle_temp": r.nozzle_temp,
+                "user_k_opt": r.user_k_opt,
+                "user_k_opt_notes": r.user_k_opt_notes,
             }
             for r in runs
         ]
     }
+
+
+def _resolve_run_path(filename: str) -> Path:
+    """Validate `filename` against path-traversal and return the resolved path.
+
+    Raises HTTPException with the appropriate status on bad input or
+    missing file. Used by every endpoint that takes a `{filename}` path
+    parameter so the whitelist stays consistent.
+    """
+    if not filename.startswith("run_") or not filename.endswith(".npz"):
+        raise HTTPException(400, "filename must match run_*.npz")
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(400, "filename must not contain path separators")
+    path = Path("runs") / filename
+    if not path.exists():
+        raise HTTPException(404, f"run {filename} not found")
+    return path
 
 
 @app.post("/api/runs/{filename}/analyse")
@@ -220,23 +333,725 @@ async def post_run_analyse(filename: str):
     Returns the same shape as the `analysis` field on `/api/status`,
     so the frontend can swap directly into its render path.
     """
-    # Whitelist filename to prevent path traversal.
-    if not filename.startswith("run_") or not filename.endswith(".npz"):
-        raise HTTPException(400, "filename must match run_*.npz")
+    path = _resolve_run_path(filename)
+    try:
+        plan, analysis = replay(path)
+    except Exception as exc:
+        raise HTTPException(500, f"replay failed: {type(exc).__name__}: {exc}")
+    user_k_opt, user_k_opt_notes = read_annotation(path)
+    return {
+        "filename": filename,
+        "k_values": [seg.k for seg in plan.segments],
+        "analysis": _analysis_to_dict(analysis),
+        "user_k_opt": user_k_opt,
+        "user_k_opt_notes": user_k_opt_notes,
+    }
+
+
+def _xlsx_response(data: bytes, filename: str) -> Response:
+    """Wrap xlsx bytes in a download response with the right headers."""
+    return Response(
+        content=data,
+        media_type=_XLSX_MEDIA_TYPE,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/runs/{filename}/export.xlsx")
+async def export_run_xlsx(filename: str):
+    """Download a saved run's loadcell trace (timestamp + force) as xlsx.
+
+    Two columns the user actually inspects -- wall-clock timestamp and
+    nozzle force (grams) -- plus a zero-based `t_rel_s` for charting.
+    See `export.saved_run_to_xlsx`.
+    """
+    path = _resolve_run_path(filename)
+    try:
+        data, out_name = saved_run_to_xlsx(path)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
+    except Exception as exc:
+        raise HTTPException(500, f"export failed: {type(exc).__name__}: {exc}")
+    return _xlsx_response(data, out_name)
+
+
+@app.get("/api/current_run/export.xlsx")
+async def export_current_run_xlsx():
+    """Download the just-finished live run's loadcell trace as xlsx.
+
+    The in-memory run carries no wall-clock anchor (only the npz dump
+    does), so we capture one now: `force_t` are monotonic seconds and the
+    monotonic/system clocks advance together, making
+    `(time.monotonic(), time.time())` a valid conversion anchor.
+    """
+    run = state.current_run
+    if run is None or not run.force_t:
+        raise HTTPException(
+            404,
+            "no completed run in memory -- finish a tuning run, or export a "
+            "saved run from the replay dropdown",
+        )
+    try:
+        data = build_force_xlsx(
+            run.force_t,
+            run.force_y,
+            mono_anchor_mono=time.monotonic(),
+            mono_anchor_unix=time.time(),
+        )
+    except Exception as exc:
+        raise HTTPException(500, f"export failed: {type(exc).__name__}: {exc}")
+    ts = int(run.state.started_at) if run.state.started_at else 0
+    out_name = f"run_{ts}.xlsx" if ts else "current_run.xlsx"
+    return _xlsx_response(data, out_name)
+
+
+# ---------- Max Flow test ----------
+
+@app.get("/api/flow/preview")
+async def get_flow_preview():
+    """Show the generated max-flow G-code without uploading anything."""
+    try:
+        udp_host = local_ip_toward(state.cfg.printer_host or "8.8.8.8")
+    except Exception:
+        udp_host = "192.168.1.10"
+    plan = build_flow_ramp(flow_params_from_config(state.cfg, udp_host=udp_host))
+    return PlainTextResponse(plan.gcode, media_type="text/x.gcode")
+
+
+@app.post("/api/flow/run")
+async def post_flow_run():
+    if state.flow_run_task is not None and not state.flow_run_task.done():
+        raise HTTPException(409, "A flow run is already in progress")
+    if state.run_task is not None and not state.run_task.done():
+        raise HTTPException(409, "A PA tuning run is in progress; wait for it to finish")
+    if state.livemap_run_task is not None and not state.livemap_run_task.done():
+        raise HTTPException(409, "A Live Map run is in progress; wait for it to finish")
+    if state.probe_run_task is not None and not state.probe_run_task.done():
+        raise HTTPException(409, "A Touch Probe run is in progress; wait for it to finish")
+    if not state.cfg.printer_host:
+        raise HTTPException(400, "printer_host must be configured")
+    if not (state.cfg.printer_api_key or state.cfg.printer_password):
+        raise HTTPException(
+            400, "either printer_api_key or printer_password must be configured"
+        )
+    if state.cfg.flow_max_mm3_s <= state.cfg.flow_min_mm3_s:
+        raise HTTPException(400, "flow_max_mm3_s must be greater than flow_min_mm3_s")
+
+    state.flow_run = None
+
+    async def _go():
+        run = await run_flow_test(
+            state.cfg, state.stream, on_update=_broadcast_flow_update
+        )
+        state.flow_run = run
+
+    state.flow_run_task = asyncio.create_task(_go())
+    return {"status": "started"}
+
+
+@app.post("/api/flow/cancel")
+async def post_flow_cancel():
+    if state.flow_run_task is not None and not state.flow_run_task.done():
+        state.flow_run_task.cancel()
+    return {"status": "ok"}
+
+
+@app.get("/api/flow/status")
+async def get_flow_status():
+    return {
+        "run": state.flow_run.to_dict() if state.flow_run else None,
+        "running": state.flow_run_task is not None and not state.flow_run_task.done(),
+    }
+
+
+@app.get("/api/flow/runs")
+async def get_flow_runs():
+    """List `runs/flow_*.npz` dumps available for replay."""
+    runs = list_flow_runs("runs")
+    return {
+        "runs": [
+            {
+                "filename": r.filename,
+                "mtime_unix": r.mtime_unix,
+                "n_force": r.n_force,
+                "n_levels": r.n_levels,
+                "min_flow": r.min_flow,
+                "max_flow": r.max_flow,
+                "flow_step": r.flow_step,
+                "duration_s": r.duration_s,
+                "filament_label": r.filament_label,
+                "nozzle_temp": r.nozzle_temp,
+            }
+            for r in runs
+        ]
+    }
+
+
+def _resolve_flow_run_path(filename: str) -> Path:
+    """Validate `filename` against path-traversal; return the resolved path."""
+    if not filename.startswith("flow_") or not filename.endswith(".npz"):
+        raise HTTPException(400, "filename must match flow_*.npz")
     if "/" in filename or "\\" in filename or ".." in filename:
         raise HTTPException(400, "filename must not contain path separators")
     path = Path("runs") / filename
     if not path.exists():
         raise HTTPException(404, f"run {filename} not found")
+    return path
+
+
+@app.post("/api/flow/runs/{filename}/analyse")
+async def post_flow_run_analyse(filename: str):
+    """Re-run `analyse_flow` on a saved flow npz."""
+    path = _resolve_flow_run_path(filename)
     try:
-        plan, analysis = replay(path)
+        _plan, analysis = replay_flow(path)
     except Exception as exc:
         raise HTTPException(500, f"replay failed: {type(exc).__name__}: {exc}")
+    return {"filename": filename, "analysis": flow_analysis_to_dict(analysis)}
+
+
+@app.get("/api/flow/runs/{filename}/export.xlsx")
+async def export_flow_run_xlsx(filename: str):
+    """Download a saved flow run's loadcell trace (timestamp + force) as xlsx."""
+    path = _resolve_flow_run_path(filename)
+    try:
+        data, out_name = saved_run_to_xlsx(path)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
+    except Exception as exc:
+        raise HTTPException(500, f"export failed: {type(exc).__name__}: {exc}")
+    return _xlsx_response(data, out_name)
+
+
+@app.get("/api/flow/current_run/export.xlsx")
+async def export_flow_current_run_xlsx():
+    """Download the just-finished live flow run's loadcell trace as xlsx."""
+    run = state.flow_run
+    if run is None or not run.force_t:
+        raise HTTPException(
+            404,
+            "no completed flow run in memory -- finish a max-flow test, or "
+            "export a saved one from the replay dropdown",
+        )
+    try:
+        data = build_force_xlsx(
+            run.force_t,
+            run.force_y,
+            mono_anchor_mono=time.monotonic(),
+            mono_anchor_unix=time.time(),
+        )
+    except Exception as exc:
+        raise HTTPException(500, f"export failed: {type(exc).__name__}: {exc}")
+    ts = int(run.state.started_at) if run.state.started_at else 0
+    out_name = f"flow_{ts}.xlsx" if ts else "flow_run.xlsx"
+    return _xlsx_response(data, out_name)
+
+
+# ---------- Live Map ----------
+# Upload a sliced ASCII .gcode, print it, and map the live nozzle-force
+# stream onto a 2D per-layer preview. The three loadcell consumers
+# (PA / flow / livemap) are mutually exclusive -- one physical stream.
+
+def _livemap_busy_reason() -> str | None:
+    if state.run_task is not None and not state.run_task.done():
+        return "a PA tuning run is in progress"
+    if state.flow_run_task is not None and not state.flow_run_task.done():
+        return "a Max Flow run is in progress"
+    if state.livemap_run_task is not None and not state.livemap_run_task.done():
+        return "a Live Map run is already in progress"
+    if state.probe_run_task is not None and not state.probe_run_task.done():
+        return "a Touch Probe run is in progress"
+    return None
+
+
+def _livemap_pending_summary(parsed: ParsedGcode, name: str) -> dict[str, Any]:
     return {
-        "filename": filename,
-        "k_values": [seg.k for seg in plan.segments],
-        "analysis": _analysis_to_dict(analysis),
+        "name": name,
+        "n_layers": len(parsed.layers),
+        "n_moves": len(parsed.moves),
+        "n_extruding": parsed.n_extruding,
+        "features": list(parsed.features),
+        "bbox": list(parsed.bbox),
+        "est_print_s": parsed.total_time_s,
+        "layer_zs": [lyr.z for lyr in parsed.layers],
     }
+
+
+@app.post("/api/livemap/upload")
+async def post_livemap_upload(file: UploadFile = File(...)):
+    """Accept a sliced ASCII .gcode, parse it, and cache it as the pending run.
+
+    Rejects binary .bgcode (we can't parse feature/layer/speed out of it) with
+    a message pointing at the PrusaSlicer ASCII-export toggle.
+    """
+    raw = await file.read()
+    if raw[:4] == b"GCDE":
+        raise HTTPException(
+            400,
+            "binary .bgcode is not supported -- re-export as plain ASCII .gcode "
+            "(untick 'Export as binary G-code' in PrusaSlicer)",
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(
+            400, "file is not valid UTF-8 text -- upload a plain ASCII .gcode"
+        )
+    parsed = await asyncio.to_thread(parse_gcode, text)
+    if not parsed.moves:
+        raise HTTPException(400, "no G0/G1 moves found -- is this a sliced .gcode?")
+    name = file.filename or "upload.gcode"
+    state.livemap_pending = {"name": name, "gcode": text, "parsed": parsed}
+    return _livemap_pending_summary(parsed, name)
+
+
+@app.get("/api/livemap/pending")
+async def get_livemap_pending():
+    if not state.livemap_pending:
+        raise HTTPException(404, "no gcode uploaded yet")
+    p = state.livemap_pending
+    return _livemap_pending_summary(p["parsed"], p["name"])
+
+
+@app.get("/api/livemap/pending/layer/{idx}")
+async def get_livemap_pending_layer(idx: int):
+    """Geometry backdrop (feature-grouped polylines) for one uploaded layer."""
+    if not state.livemap_pending:
+        raise HTTPException(404, "no gcode uploaded yet")
+    parsed: ParsedGcode = state.livemap_pending["parsed"]
+    if idx < 0 or idx >= len(parsed.layers):
+        raise HTTPException(404, f"layer {idx} out of range")
+    lyr = parsed.layers[idx]
+    return {"index": idx, "z": lyr.z, "polylines": layer_polylines(parsed, idx)}
+
+
+@app.post("/api/livemap/run")
+async def post_livemap_run():
+    busy = _livemap_busy_reason()
+    if busy:
+        raise HTTPException(409, busy[:1].upper() + busy[1:])
+    if not state.livemap_pending:
+        raise HTTPException(400, "upload a .gcode first")
+    if not state.cfg.printer_host:
+        raise HTTPException(400, "printer_host must be configured")
+    if not (state.cfg.printer_api_key or state.cfg.printer_password):
+        raise HTTPException(
+            400, "either printer_api_key or printer_password must be configured"
+        )
+
+    pending = state.livemap_pending
+    state.livemap_run = None
+
+    async def _go():
+        run = await run_live_map(
+            state.cfg, state.stream, pending["gcode"], pending["parsed"],
+            pending["name"], on_update=_broadcast_livemap_update,
+        )
+        state.livemap_run = run
+
+    state.livemap_run_task = asyncio.create_task(_go())
+    return {"status": "started"}
+
+
+@app.post("/api/livemap/cancel")
+async def post_livemap_cancel():
+    if state.livemap_run_task is not None and not state.livemap_run_task.done():
+        state.livemap_run_task.cancel()
+    return {"status": "ok"}
+
+
+@app.get("/api/livemap/status")
+async def get_livemap_status():
+    return {
+        "run": state.livemap_run.to_dict() if state.livemap_run else None,
+        "running": state.livemap_run_task is not None and not state.livemap_run_task.done(),
+        "has_pending": bool(state.livemap_pending),
+    }
+
+
+@app.get("/api/livemap/runs")
+async def get_livemap_runs():
+    """List runs/livemap_*.npz dumps available for review."""
+    runs = list_livemap_runs("runs")
+    return {
+        "runs": [
+            {
+                "filename": r.filename,
+                "mtime_unix": r.mtime_unix,
+                "n_force": r.n_force,
+                "n_layers": r.n_layers,
+                "n_moves": r.n_moves,
+                "duration_s": r.duration_s,
+                "est_print_s": r.est_print_s,
+                "gcode_name": r.gcode_name,
+            }
+            for r in runs
+        ]
+    }
+
+
+def _resolve_livemap_run_path(filename: str) -> Path:
+    if not filename.startswith("livemap_") or not filename.endswith(".npz"):
+        raise HTTPException(400, "filename must match livemap_*.npz")
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(400, "filename must not contain path separators")
+    path = Path("runs") / filename
+    if not path.exists():
+        raise HTTPException(404, f"run {filename} not found")
+    return path
+
+
+async def _load_livemap_review(filename: str) -> MappedRun:
+    """Return the cached MappedRun for `filename`, mapping it if not cached.
+
+    Mapping (parse + interpolate + cross-check) is CPU-bound, so it runs in a
+    thread to keep the event loop responsive on big prints.
+    """
+    review = state.livemap_review
+    if review and review.get("filename") == filename:
+        return review["mapped"]
+    path = _resolve_livemap_run_path(filename)
+    mapped = await asyncio.to_thread(replay_livemap, path)
+    state.livemap_review = {"filename": filename, "mapped": mapped}
+    return mapped
+
+
+@app.post("/api/livemap/runs/{filename}/analyse")
+async def post_livemap_analyse(filename: str):
+    """Map a saved run (tare + layering + feature stats + cross-check)."""
+    _resolve_livemap_run_path(filename)  # validate before threading
+    try:
+        mapped = await _load_livemap_review(filename)
+    except Exception as exc:
+        raise HTTPException(500, f"replay failed: {type(exc).__name__}: {exc}")
+    return mapped_summary(mapped, filename)
+
+
+@app.get("/api/livemap/runs/{filename}/layer/{idx}")
+async def get_livemap_run_layer(filename: str, idx: int):
+    """Geometry + mapped force points for one layer of a saved run."""
+    _resolve_livemap_run_path(filename)
+    try:
+        mapped = await _load_livemap_review(filename)
+    except Exception as exc:
+        raise HTTPException(500, f"replay failed: {type(exc).__name__}: {exc}")
+    if idx < 0 or idx >= len(mapped.parsed.layers):
+        raise HTTPException(404, f"layer {idx} out of range")
+    return layer_detail(mapped, idx)
+
+
+@app.get("/api/livemap/runs/{filename}/export.xlsx")
+async def export_livemap_run_xlsx(filename: str):
+    """Download a saved Live Map run's loadcell trace (timestamp + force)."""
+    path = _resolve_livemap_run_path(filename)
+    try:
+        data, out_name = saved_run_to_xlsx(path)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
+    except Exception as exc:
+        raise HTTPException(500, f"export failed: {type(exc).__name__}: {exc}")
+    return _xlsx_response(data, out_name)
+
+
+# ---------- Touch Probe (lateral characterisation) ----------
+# Push the nozzle tip sideways into a rigid target and capture loadcell +
+# position to see whether lateral contact registers cleanly. Shares the
+# single loadcell stream with the other three modes (mutually exclusive).
+
+@app.get("/api/probe/preview")
+async def get_probe_preview():
+    """Show the generated touch-probe G-code without uploading anything."""
+    try:
+        udp_host = local_ip_toward(state.cfg.printer_host or "8.8.8.8")
+    except Exception:
+        udp_host = "192.168.1.10"
+    plan = build_probe_test(probe_params_from_config(state.cfg, udp_host=udp_host))
+    return PlainTextResponse(plan.gcode, media_type="text/x.gcode")
+
+
+@app.post("/api/probe/run")
+async def post_probe_run():
+    if state.probe_run_task is not None and not state.probe_run_task.done():
+        raise HTTPException(409, "A Touch Probe run is already in progress")
+    if state.run_task is not None and not state.run_task.done():
+        raise HTTPException(409, "A PA tuning run is in progress; wait for it to finish")
+    if state.flow_run_task is not None and not state.flow_run_task.done():
+        raise HTTPException(409, "A Max Flow run is in progress; wait for it to finish")
+    if state.livemap_run_task is not None and not state.livemap_run_task.done():
+        raise HTTPException(409, "A Live Map run is in progress; wait for it to finish")
+    if not state.cfg.printer_host:
+        raise HTTPException(400, "printer_host must be configured")
+    if not (state.cfg.printer_api_key or state.cfg.printer_password):
+        raise HTTPException(
+            400, "either printer_api_key or printer_password must be configured"
+        )
+
+    state.probe_run = None
+
+    async def _go():
+        run = await run_probe_test(
+            state.cfg, state.stream, on_update=_broadcast_probe_update
+        )
+        state.probe_run = run
+
+    state.probe_run_task = asyncio.create_task(_go())
+    return {"status": "started"}
+
+
+@app.post("/api/probe/cancel")
+async def post_probe_cancel():
+    if state.probe_run_task is not None and not state.probe_run_task.done():
+        state.probe_run_task.cancel()
+    return {"status": "ok"}
+
+
+@app.get("/api/probe/status")
+async def get_probe_status():
+    return {
+        "run": state.probe_run.to_dict() if state.probe_run else None,
+        "running": state.probe_run_task is not None and not state.probe_run_task.done(),
+    }
+
+
+@app.get("/api/probe/runs")
+async def get_probe_runs():
+    """List `runs/probe_*.npz` dumps available for replay."""
+    runs = list_probe_runs("runs")
+    return {
+        "runs": [
+            {
+                "filename": r.filename,
+                "mtime_unix": r.mtime_unix,
+                "n_force": r.n_force,
+                "axis": r.axis,
+                "dir": r.dir,
+                "n_touches": r.n_touches,
+                "creep_mm": r.creep_mm,
+                "duration_s": r.duration_s,
+            }
+            for r in runs
+        ]
+    }
+
+
+def _resolve_probe_run_path(filename: str) -> Path:
+    """Validate `filename` against path-traversal; return the resolved path."""
+    if not filename.startswith("probe_") or not filename.endswith(".npz"):
+        raise HTTPException(400, "filename must match probe_*.npz")
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(400, "filename must not contain path separators")
+    path = Path("runs") / filename
+    if not path.exists():
+        raise HTTPException(404, f"run {filename} not found")
+    return path
+
+
+@app.post("/api/probe/runs/{filename}/analyse")
+async def post_probe_run_analyse(filename: str):
+    """Re-run `analyse_probe` on a saved probe npz."""
+    path = _resolve_probe_run_path(filename)
+    try:
+        _plan, analysis = replay_probe(path)
+    except Exception as exc:
+        raise HTTPException(500, f"replay failed: {type(exc).__name__}: {exc}")
+    return {"filename": filename, "analysis": probe_analysis_to_dict(analysis)}
+
+
+@app.get("/api/probe/runs/{filename}/export.xlsx")
+async def export_probe_run_xlsx(filename: str):
+    """Download a saved probe run's loadcell trace (timestamp + force) as xlsx."""
+    path = _resolve_probe_run_path(filename)
+    try:
+        data, out_name = saved_run_to_xlsx(path)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
+    except Exception as exc:
+        raise HTTPException(500, f"export failed: {type(exc).__name__}: {exc}")
+    return _xlsx_response(data, out_name)
+
+
+@app.get("/api/probe/current_run/export.xlsx")
+async def export_probe_current_run_xlsx():
+    """Download the just-finished live probe run's loadcell trace as xlsx."""
+    run = state.probe_run
+    if run is None or not run.force_t:
+        raise HTTPException(
+            404,
+            "no completed probe run in memory -- finish a touch-probe test, or "
+            "export a saved one from the replay dropdown",
+        )
+    try:
+        data = build_force_xlsx(
+            run.force_t,
+            run.force_y,
+            mono_anchor_mono=time.monotonic(),
+            mono_anchor_unix=time.time(),
+        )
+    except Exception as exc:
+        raise HTTPException(500, f"export failed: {type(exc).__name__}: {exc}")
+    ts = int(run.state.started_at) if run.state.started_at else 0
+    out_name = f"probe_{ts}.xlsx" if ts else "probe_run.xlsx"
+    return _xlsx_response(data, out_name)
+
+
+class AnnotateModel(BaseModel):
+    """Request body for `POST /api/runs/<filename>/annotate`.
+
+    `k` is the user's measured ground-truth K from a test print, or
+    `null` to clear the annotation. `notes` is free-text context
+    (filament, test method, date — anything the user wants to remember
+    when they look at this run again later).
+    """
+    k: float | None = None
+    notes: str = ""
+
+
+@app.post("/api/runs/{filename}/annotate")
+async def post_run_annotate(filename: str, body: AnnotateModel):
+    """Attach (or clear) the user-supplied ground-truth K on a saved run.
+
+    Re-writes the npz atomically. The new `user_k_opt` / `user_k_opt_notes`
+    flow back through `/api/runs` and `/api/runs/<f>/analyse` so the UI
+    can pre-fill the input on re-open.
+    """
+    path = _resolve_run_path(filename)
+    try:
+        annotate_run(path, body.k, body.notes)
+    except Exception as exc:
+        raise HTTPException(500, f"annotate failed: {type(exc).__name__}: {exc}")
+    k, notes = read_annotation(path)
+    return {"filename": filename, "user_k_opt": k, "user_k_opt_notes": notes}
+
+
+class OptimiseStartModel(BaseModel):
+    """Request body for `POST /api/optimise_weights/start`.
+
+    `excluded_metrics` is a list of metric names (subset of the 8
+    optimisable metrics) to lock at weight 0 -- the UI checkboxes feed
+    this. `alpha` trades bias against bootstrap stability (default 1.0
+    weights them equally). `n_boot`, `popsize`, `maxiter`, `seed` are
+    inner-loop knobs exposed for power-user tuning.
+    """
+    excluded_metrics: list[str] = Field(default_factory=list)
+    alpha: float = 1.0
+    n_boot: int = Field(200, ge=20, le=2000)
+    popsize: int = Field(15, ge=4, le=64)
+    maxiter: int = Field(50, ge=5, le=500)
+    seed: int = 0xC0FFEE
+
+
+def _optimise_worker(job_id: str, body: OptimiseStartModel) -> None:
+    """Runs in a thread (DE is CPU-bound, blocks the event loop otherwise).
+
+    Writes progress + final result into `state.optimise_jobs[job_id]`.
+    """
+    job = state.optimise_jobs[job_id]
+
+    def progress(frac: float, msg: str) -> None:
+        job["progress"] = float(frac)
+        job["message"] = msg
+
+    try:
+        paths = discover_annotated_runs("runs")
+        if not paths:
+            raise ValueError(
+                "no annotated runs found -- annotate at least one saved npz "
+                "with its ground-truth K via the replay panel first"
+            )
+        result = optimise_weights(
+            paths,
+            excluded_metrics=body.excluded_metrics,
+            alpha=body.alpha,
+            n_boot=body.n_boot,
+            popsize=body.popsize,
+            maxiter=body.maxiter,
+            seed=body.seed,
+            progress_cb=progress,
+        )
+        job["result"] = result_to_dict(result)
+        job["status"] = "done"
+    except Exception as exc:
+        log.exception("optimiser job %s failed", job_id)
+        job["status"] = "error"
+        job["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        job["progress"] = 1.0
+
+
+@app.get("/api/optimise_weights/info")
+async def get_optimise_info():
+    """Return the metric names the optimiser can tune + count of annotated runs.
+
+    The GUI uses this to render the checkbox list and the "N annotated
+    runs available" hint above the Run button.
+    """
+    return {
+        "optimisable_metrics": list(OPTIMISABLE_METRICS),
+        "annotated_run_count": len(discover_annotated_runs("runs")),
+    }
+
+
+@app.post("/api/optimise_weights/start")
+async def post_optimise_start(body: OptimiseStartModel):
+    """Kick off a background optimiser job. Returns a `job_id` the UI
+    polls via `GET /api/optimise_weights/<job_id>`.
+    """
+    import uuid
+
+    job_id = uuid.uuid4().hex[:12]
+    state.optimise_jobs[job_id] = {
+        "status": "running",
+        "progress": 0.0,
+        "message": "queued",
+        "result": None,
+        "error": None,
+    }
+    asyncio.create_task(asyncio.to_thread(_optimise_worker, job_id, body))
+    return {"job_id": job_id}
+
+
+@app.get("/api/optimise_weights/{job_id}")
+async def get_optimise_job(job_id: str):
+    """Poll the status of a running optimiser job."""
+    job = state.optimise_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, f"job {job_id} not found")
+    return {"job_id": job_id, **job}
+
+
+@app.post("/api/optimise_weights/{job_id}/apply")
+async def post_optimise_apply(job_id: str):
+    """Persist the optimised weights from a done job to `runs/weights_opt.json`.
+
+    The server preloads that file at startup; existing UI weight
+    sliders pre-fill from it on the next analysis render.
+    """
+    job = state.optimise_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, f"job {job_id} not found")
+    if job.get("status") != "done":
+        raise HTTPException(409, f"job is in state {job.get('status')!r}, not done")
+    result_dict = job.get("result")
+    if not result_dict:
+        raise HTTPException(500, "job marked done but has no result")
+    # Reconstruct a minimal OptimiseResult-shaped object for write_weights_json.
+    # write_weights_json only reads a handful of attributes; pass a small
+    # SimpleNamespace so we don't have to round-trip through OptimiseResult.
+    from types import SimpleNamespace
+    payload = SimpleNamespace(
+        weights_display=result_dict["weights_display"],
+        alpha=result_dict["alpha"],
+        n_runs=result_dict["n_runs"],
+        rms_error=result_dict["rms_error"],
+        median_abs_error=result_dict["median_abs_error"],
+        excluded_metrics=result_dict["excluded_metrics"],
+        timestamp_unix=result_dict["timestamp_unix"],
+    )
+    try:
+        write_weights_json(payload)
+    except Exception as exc:
+        raise HTTPException(500, f"failed to write weights file: {exc}")
+    return {"job_id": job_id, "written": "runs/weights_opt.json"}
 
 
 @app.get("/api/metrics_seen")
@@ -280,6 +1095,21 @@ async def ws_live(ws: WebSocket):
     if state.current_run is not None:
         try:
             await ws.send_json({"type": "run", "data": state.current_run.to_dict()})
+        except Exception:
+            pass
+    if state.flow_run is not None:
+        try:
+            await ws.send_json({"type": "flow_run", "data": state.flow_run.to_dict()})
+        except Exception:
+            pass
+    if state.livemap_run is not None:
+        try:
+            await ws.send_json({"type": "livemap_run", "data": state.livemap_run.to_dict()})
+        except Exception:
+            pass
+    if state.probe_run is not None:
+        try:
+            await ws.send_json({"type": "probe_run", "data": state.probe_run.to_dict()})
         except Exception:
             pass
     # Live loadcell fan-out: single subscriber to loadcell_value (the only
@@ -331,6 +1161,11 @@ async def ws_live(ws: WebSocket):
     tasks = [
         asyncio.create_task(forward("loadcell_value", "force_batch")),
         asyncio.create_task(forward("pos_x", "pos_batch")),
+        # pos_y / pos_z power the Live Map 2D placement + layer detection.
+        # They only stream when M331-enabled (the Live Map preamble does so);
+        # PA / flow modes simply ignore these message types.
+        asyncio.create_task(forward("pos_y", "pos_y_batch")),
+        asyncio.create_task(forward("pos_z", "pos_z_batch")),
     ]
     try:
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -353,6 +1188,42 @@ def _first_numeric(fields: dict) -> float | None:
 
 async def _broadcast_update(run: TuningRun) -> None:
     payload = {"type": "run", "data": run.to_dict()}
+    dead: list[WebSocket] = []
+    for ws in list(state.ws_clients):
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        state.ws_clients.discard(ws)
+
+
+async def _broadcast_flow_update(run: FlowRun) -> None:
+    payload = {"type": "flow_run", "data": run.to_dict()}
+    dead: list[WebSocket] = []
+    for ws in list(state.ws_clients):
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        state.ws_clients.discard(ws)
+
+
+async def _broadcast_livemap_update(run: LiveMapRun) -> None:
+    payload = {"type": "livemap_run", "data": run.to_dict()}
+    dead: list[WebSocket] = []
+    for ws in list(state.ws_clients):
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        state.ws_clients.discard(ws)
+
+
+async def _broadcast_probe_update(run: ProbeRun) -> None:
+    payload = {"type": "probe_run", "data": run.to_dict()}
     dead: list[WebSocket] = []
     for ws in list(state.ws_clients):
         try:

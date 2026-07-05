@@ -92,6 +92,56 @@ class TuningRun:
         }
 
 
+def _bd_weights_payload(shipped: dict[str, float]) -> dict[str, Any]:
+    """Pick which weights to ship to the UI: optimised (if present) or shipped.
+
+    Reads `runs/weights_opt.json` once per call (cheap; file is tiny).
+    The UI uses `bd_default_weights` to initialise the sliders and
+    `bd_weights_source` to render a badge ("defaults" vs
+    "optimised (N runs, date)"). When no optimiser file exists, the
+    shipped BD_DEFAULT_WEIGHTS go out unchanged.
+    """
+    # Local import to avoid a runner→optimiser→replay cycle at module load
+    # (replay imports from analysis, runner imports from gcode_gen; the
+    # late binding here keeps the cycle from materialising).
+    from .optimiser import read_weights_json
+    import datetime as _dt
+
+    data = read_weights_json()
+    if not data:
+        return {
+            "bd_default_weights": shipped,
+            "bd_weights_source": {"kind": "defaults"},
+        }
+    opt = data.get("weights") or {}
+    # Merge: any metric the optimiser didn't write keeps its shipped
+    # value (so a partial optimiser file doesn't silently drop a metric
+    # from the cost). The UI sees the *effective* weights either way.
+    merged = dict(shipped)
+    for k, v in opt.items():
+        if isinstance(v, (int, float)):
+            merged[k] = float(v)
+    ts = data.get("timestamp_unix")
+    when = ""
+    if isinstance(ts, (int, float)):
+        try:
+            when = _dt.datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d")
+        except Exception:
+            when = ""
+    return {
+        "bd_default_weights": merged,
+        "bd_weights_source": {
+            "kind": "optimised",
+            "n_runs": data.get("n_runs"),
+            "rms_error": data.get("rms_error"),
+            "median_abs_error": data.get("median_abs_error"),
+            "alpha": data.get("alpha"),
+            "excluded_metrics": data.get("excluded_metrics") or [],
+            "date": when,
+        },
+    }
+
+
 def _analysis_to_dict(a: SweepAnalysis) -> dict[str, Any]:
     return {
         "per_k": [
@@ -153,11 +203,21 @@ def _analysis_to_dict(a: SweepAnalysis) -> dict[str, Any]:
         # `bd_per_k` is one row per K with medians + sweep-normalised
         # values + segment counts; `bd_k_opt` is the recommended K from
         # the default-weight composite cost; `bd_default_weights` are
-        # the slider defaults.
+        # the slider defaults. If `runs/weights_opt.json` exists (the
+        # optimiser persisted user-tuned weights), those override the
+        # shipped defaults so the UI sliders pre-fill with the optimised
+        # values; the bd_weights_source field tells the UI which set is
+        # active for the on-screen badge.
         "bd_k_opt": (
             _safe_float(a.bd_k_opt) if a.bd_k_opt is not None else None
         ),
-        "bd_default_weights": a.bd_default_weights,
+        # Signed-area zero-crossing fits (overshoot↔lag discriminator).
+        # Each holds {k_opt, slope, intercept, r_squared, method}; the
+        # backing per-K medians ride along in bd_per_k[*].medians under
+        # rise_signed_area / fall_signed_area.
+        "bd_signed_rise_fit": _fit_to_dict(a.bd_signed_rise_fit),
+        "bd_signed_fall_fit": _fit_to_dict(a.bd_signed_fall_fit),
+        **_bd_weights_payload(a.bd_default_weights),
         "bd_per_k": [
             {
                 "k": r.k,

@@ -6,6 +6,29 @@
   <title>Prusa PA Tuner</title>
   <link rel="stylesheet" href="/static/styles.css" />
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <style>
+    /* Mode toggle (PA Tuning | Max Flow) + view show/hide. The default
+       (no body class) shows the PA tuning view; body.mode-flow swaps to
+       the Max Flow view. Shared cards (Printer, Filament, Live loadcell)
+       carry neither class and stay visible in both. */
+    .mode-toggle { display: flex; gap: 8px; margin: 4px 0 14px; }
+    .mode-toggle button {
+      flex: 0 0 auto; padding: 8px 18px; border-radius: 6px;
+      border: 1px solid #2a2f37; background: #161b22; color: #8b949e;
+      cursor: pointer; font-size: 0.95em;
+    }
+    .mode-toggle button.active {
+      background: #1f6feb; border-color: #1f6feb; color: #fff; font-weight: 600;
+    }
+    /* Four modes: no class = PA (default). Hide the views that don't
+       belong to the active mode; shared cards carry no view class. */
+    body.mode-flow .pa-view, body.mode-flow .livemap-view, body.mode-flow .probe-view { display: none; }
+    body.mode-livemap .pa-view, body.mode-livemap .flow-view, body.mode-livemap .probe-view { display: none; }
+    body.mode-probe .pa-view, body.mode-probe .flow-view, body.mode-probe .livemap-view { display: none; }
+    body:not(.mode-flow):not(.mode-livemap):not(.mode-probe) .flow-view,
+    body:not(.mode-flow):not(.mode-livemap):not(.mode-probe) .livemap-view,
+    body:not(.mode-flow):not(.mode-livemap):not(.mode-probe) .probe-view { display: none; }
+  </style>
 </head>
 <body>
   <header>
@@ -14,6 +37,12 @@
   </header>
 
   <main>
+    <div class="mode-toggle">
+      <button id="mode_pa" type="button" class="active">PA Tuning</button>
+      <button id="mode_flow" type="button">Max Flow</button>
+      <button id="mode_livemap" type="button">Live Map</button>
+      <button id="mode_probe" type="button">Touch Probe</button>
+    </div>
     <section class="card">
       <h2>1. Printer</h2>
       <div class="row">
@@ -40,7 +69,7 @@
       </div>
     </section>
 
-    <section class="card">
+    <section class="card pa-view">
       <h2>3. Sweep parameters</h2>
       <div class="row">
         <label>Slow flow (mm³/s) <input id="slow_flow_mm3_s" type="number" step="0.01" value="1.92" /></label>
@@ -73,7 +102,7 @@
       </div>
     </section>
 
-    <section class="card actions">
+    <section class="card actions pa-view">
       <button id="btn_save" type="button">Save config</button>
       <button id="btn_preview" type="button">Preview G-code</button>
       <button id="btn_run" type="button" class="primary">Start tuning run</button>
@@ -83,6 +112,53 @@
         <div id="run_meta" class="meta" style="margin-top:4px; font-size: 0.85em;"></div>
       </label>
       <button id="btn_replay_refresh" type="button">↻</button>
+      <button id="btn_export_run" type="button" title="Export the selected saved run's loadcell trace (timestamp + nozzle force) to .xlsx">⬇ XLSX</button>
+    </section>
+
+    <section class="card flow-view">
+      <h2>Max Flow — parameters</h2>
+      <div class="meta">
+        Free-air stepped flow ramp: extrudes at increasing volumetric flow
+        rates and watches the loadcell back-pressure for the point where
+        the hotend can't melt fast enough. Temperature + filament come from
+        the shared cards above. This extrudes into the air, so expect a
+        string/bird's-nest at high flow.
+      </div>
+      <div class="row">
+        <label>Min flow (mm³/s) <input id="flow_min_mm3_s" type="number" step="0.5" min="0.1" value="5" /></label>
+        <label>Max flow (mm³/s) <input id="flow_max_mm3_s" type="number" step="0.5" min="0.1" value="30" /></label>
+        <label>Step (mm³/s) <input id="flow_step_mm3_s" type="number" step="0.1" min="0.1" value="1" /></label>
+        <label title="How many seconds to extrude at each flow level. Longer gives the hotend more time to add heat and reach true thermal steady state before the force is measured (the first 'settle frac' of it is discarded). Longer also means more filament slung into the air.">
+          Seconds / step <input id="flow_dwell_s" type="number" step="0.5" min="0.5" value="3" />
+        </label>
+      </div>
+      <details>
+        <summary class="meta" style="cursor:pointer;">Advanced (settle, warm-up &amp; tare)</summary>
+        <div class="row" style="margin-top:8px;">
+          <label title="Fraction of each level's seconds/step discarded as settle (melt-pressure + accel transient) before measuring steady-state force + variance.">
+            Settle frac <input id="flow_settle_frac" type="number" step="0.05" min="0" max="0.95" value="0.5" />
+          </label>
+          <label title="Warm-up extrusion at min flow before the sweep, to purge old filament and reach steady melt pressure.">
+            Warm-up (s) <input id="flow_warmup_s" type="number" step="0.5" min="0" value="3" />
+          </label>
+          <label title="No-flow hold after the start marker (extruder idle). The loadcell reading here is the static head load, which is tared off so the plotted force starts at 0.">
+            Tare hold (s) <input id="flow_tare_dwell_s" type="number" step="0.5" min="0" value="1.5" />
+          </label>
+        </div>
+      </details>
+    </section>
+
+    <section class="card actions flow-view">
+      <button id="btn_flow_save" type="button">Save config</button>
+      <button id="btn_flow_preview" type="button">Preview G-code</button>
+      <button id="btn_flow_run" type="button" class="primary">Start max-flow test</button>
+      <button id="btn_flow_cancel" type="button" class="danger">Cancel</button>
+      <label class="replay-picker">Replay a saved flow run
+        <select id="flow_runs_select"><option value="">— select —</option></select>
+        <div id="flow_run_meta" class="meta" style="margin-top:4px; font-size:0.85em;"></div>
+      </label>
+      <button id="btn_flow_replay_refresh" type="button">↻</button>
+      <button id="btn_flow_export_run" type="button" title="Export the selected saved flow run's loadcell trace (timestamp + nozzle force) to .xlsx">⬇ XLSX</button>
     </section>
 
     <section class="card">
@@ -96,7 +172,277 @@
       </div>
     </section>
 
-    <section class="card">
+    <!-- ===================== Live Map ===================== -->
+    <section class="card livemap-view">
+      <h2>Live Map — print file</h2>
+      <div class="meta">
+        Upload a sliced <strong>ASCII</strong> .gcode (in PrusaSlicer, untick
+        <em>Export as binary G-code</em>). We inject the metric preamble and
+        print it, mapping the live nozzle loadcell force onto the gcode as it
+        prints — the part geometry is untouched. The map is saved so you can
+        scrub the layers again later.
+      </div>
+      <div class="row">
+        <label class="wide">G-code file
+          <input id="lm_file" type="file" accept=".gcode,.g,.gco,text/plain" />
+        </label>
+        <button id="lm_upload" type="button">Upload &amp; parse</button>
+      </div>
+      <div id="lm_summary" class="meta" style="margin-top:6px;"></div>
+      <div class="row actions" style="margin-top:8px;">
+        <button id="lm_run" type="button" class="primary" disabled>Start print &amp; map</button>
+        <button id="lm_cancel" type="button" class="danger">Cancel</button>
+      </div>
+      <div class="status">
+        <span id="lm_state">idle</span> ·
+        <span id="lm_msg"></span> ·
+        <span id="lm_pct">0</span>%
+      </div>
+    </section>
+
+    <section class="card livemap-view">
+      <h2>Live Map — 2D nozzle-load map</h2>
+      <div class="meta">
+        Top-down view of one layer. The path is coloured by nozzle force
+        (force mode) over a faint gcode backdrop; switch to feature mode to
+        see what each region is (perimeter / infill / …). Live, it follows the
+        layer being printed; grab the slider to study a finished layer, then
+        <em>Jump to live</em> to resume.
+      </div>
+      <div class="row" style="align-items:center; gap:10px; flex-wrap:wrap; margin:6px 0;">
+        <button id="lm_prev" type="button" title="previous layer (←)">◀</button>
+        <input id="lm_layer_slider" type="range" min="0" max="0" value="0" style="flex:1 1 220px;" />
+        <button id="lm_next" type="button" title="next layer (→)">▶</button>
+        <span id="lm_layer_label" class="meta">no file loaded</span>
+        <button id="lm_live" type="button" title="follow the layer being printed">Jump to live</button>
+        <label class="meta">colour
+          <select id="lm_color_mode">
+            <option value="force">nozzle force</option>
+            <option value="feature">feature type</option>
+            <option value="random">random (segments)</option>
+          </select>
+        </label>
+        <label class="meta" title="Snapped: project each reading onto the nearest gcode line (straight, matches the preview). Measured: the raw interpolated toolhead position (faithful but bends at turns where the position stream is sparse).">
+          position
+          <select id="lm_pos_mode">
+            <option value="snapped">snapped to gcode</option>
+            <option value="raw">measured (raw)</option>
+          </select>
+        </label>
+        <label class="meta" id="lm_scale_wrap" title="Clamp the load colour scale. Lower the max to bring out small variations; raise it to suppress outliers.">
+          load scale
+          <input id="lm_scale_min" type="number" step="50" style="width:72px;" />
+          –
+          <input id="lm_scale_max" type="number" step="50" style="width:72px;" />
+          <button id="lm_scale_auto" type="button" title="reset to auto (2–98 percentile)">auto</button>
+        </label>
+        <span id="lm_divergence" class="meta"></span>
+      </div>
+      <div id="lm_plot" style="width:100%;height:540px;"></div>
+      <div id="lm_legend" class="meta" style="margin-top:4px;"></div>
+    </section>
+
+    <section class="card livemap-view">
+      <h2>Live Map — review &amp; saved runs</h2>
+      <div class="row" style="align-items:flex-end; gap:8px;">
+        <label class="replay-picker">Open a saved Live Map run
+          <select id="lm_runs_select"><option value="">— select —</option></select>
+        </label>
+        <button id="lm_runs_refresh" type="button">↻</button>
+        <button id="lm_export" type="button" title="Export the selected run's loadcell trace (timestamp + nozzle force) to .xlsx">⬇ XLSX</button>
+      </div>
+      <div id="lm_run_meta" class="meta" style="margin-top:4px;"></div>
+      <h3 style="margin-top:12px;">Nozzle load by feature</h3>
+      <div class="meta">Tared force per feature type, aggregated over the run.</div>
+      <table id="lm_feature_table" class="bd-metric-table" style="margin-top:6px;"></table>
+    </section>
+
+    <!-- ===================== Touch Probe ===================== -->
+    <section class="card probe-view">
+      <h2>Touch Probe — lateral sensitivity test</h2>
+      <div class="meta">
+        <strong>Step 1: characterise the sensor before building the probe.</strong>
+        This pushes the nozzle <em>tip</em> sideways (±X / ±Y) into a rigid
+        target and records the Z loadcell while it creeps in, to find out
+        whether lateral contact registers a clean, repeatable force at all.
+        The loadcell is an axial (Z) sensor; lateral force reaches it only as
+        a bending moment, so this is an open question we have to measure.
+        <br/><br/>
+        <strong>Safe by design:</strong> the creep is short (the
+        <em>creep distance</em> is a hard cap on how far we can push past
+        contact) and slow, and the nozzle is <em>cold</em> by default — so
+        even if nothing stops the move, the worst case is a gentle lean, not a
+        crash. <strong>Set up:</strong> clamp a rigid object so the nozzle
+        just touches it partway through the creep, then point the probe at it
+        with the standoff + axis below. Contact should land after the first
+        ~20 % of the creep (that early part is used as the no-contact
+        baseline).
+      </div>
+      <div class="row">
+        <label>Axis
+          <select id="probe_axis">
+            <option value="X">X</option>
+            <option value="Y">Y</option>
+          </select>
+        </label>
+        <label>Direction
+          <select id="probe_dir">
+            <option value="+">+ (toward higher)</option>
+            <option value="-">− (toward lower)</option>
+          </select>
+        </label>
+        <label>Standoff X (mm) <input id="probe_start_x" type="number" step="1" value="125" /></label>
+        <label>Standoff Y (mm) <input id="probe_start_y" type="number" step="1" value="110" /></label>
+        <label title="Probe height. Also the Z used to travel to the standoff — keep the path clear of obstacles at this height.">
+          Probe Z (mm) <input id="probe_z" type="number" step="0.5" value="5" />
+        </label>
+      </div>
+      <div class="row">
+        <label title="Slow creep distance toward the target. This is the HARD CAP on how far the nozzle can push past contact — keep it small (≤ 2 mm).">
+          Creep distance (mm) <input id="probe_creep_mm" type="number" step="0.1" min="0.1" max="20" value="1.0" />
+        </label>
+        <label title="Creep speed. Slow keeps the push gentle and gives the loadcell time to respond. 30 mm/min = 0.5 mm/s.">
+          Slow feed (mm/min) <input id="probe_slow_feed_mm_min" type="number" step="5" min="1" value="30" />
+        </label>
+        <label title="Rapid speed for repositioning between touches (the fast approach to the standoff and the retract).">
+          Travel feed (mm/min) <input id="probe_travel_feed_mm_min" type="number" step="100" min="100" value="3000" />
+        </label>
+        <label title="How many times to repeat the creep from the same standoff. More touches = better repeatability estimate.">
+          Touches <input id="probe_n_touches" type="number" step="1" min="1" max="50" value="5" />
+        </label>
+      </div>
+      <div class="row">
+        <label title="How far to retract past the standoff between touches so each touch fully clears contact before re-approaching.">
+          Back-off (mm) <input id="probe_backoff_mm" type="number" step="0.5" min="0" value="1.0" />
+        </label>
+        <label title="Dwell at the standoff and at the far end of each creep (ms), so the contact plateau is captured.">
+          Settle (ms) <input id="probe_settle_ms" type="number" step="50" min="0" max="10000" value="300" />
+        </label>
+        <label title="Nozzle temperature. 0 = COLD probe (recommended) — a cold brass tip won't melt or mar a plastic target and the loadcell reads fine cold.">
+          Probe temp (°C, 0 = cold) <input id="probe_temp" type="number" step="5" min="0" value="0" />
+        </label>
+      </div>
+    </section>
+
+    <section class="card actions probe-view">
+      <button id="btn_probe_save" type="button">Save config</button>
+      <button id="btn_probe_preview" type="button">Preview G-code</button>
+      <button id="btn_probe_run" type="button" class="primary">Start touch-probe test</button>
+      <button id="btn_probe_cancel" type="button" class="danger">Cancel</button>
+      <label class="replay-picker">Replay a saved probe run
+        <select id="probe_runs_select"><option value="">— select —</option></select>
+        <div id="probe_run_meta" class="meta" style="margin-top:4px; font-size:0.85em;"></div>
+      </label>
+      <button id="btn_probe_replay_refresh" type="button">↻</button>
+      <button id="btn_probe_export_run" type="button" title="Export the selected saved probe run's loadcell trace (timestamp + nozzle force) to .xlsx">⬇ XLSX</button>
+    </section>
+
+    <section class="card probe-view">
+      <h2>Touch Probe — results</h2>
+      <div class="meta">
+        Force vs. probe-axis position, every touch overlaid. A usable lateral
+        probe needs a clean <em>knee</em>: force flat (no contact), then a
+        sharp, monotonic rise — landing at the <strong>same position</strong>
+        on every touch. Vertical dashed lines mark the detected contact point
+        per touch; tight clustering = good repeatability.
+      </div>
+      <div class="row" style="align-items:flex-start;">
+        <div class="result-block" style="flex:1 1 240px;">
+          <h3>Verdict</h3>
+          <div id="probe_verdict" class="big">—</div>
+          <table id="probe_stats_table" class="bd-metric-table" style="margin-top:8px;"></table>
+          <div class="row" style="margin-top:8px;">
+            <button id="btn_probe_export_current" type="button" title="Export this run's loadcell trace (timestamp + nozzle force) to .xlsx">Export data (XLSX)</button>
+            <span id="probe_copy_status" class="meta"></span>
+          </div>
+        </div>
+        <div class="result-block" style="flex:2 1 380px;">
+          <div id="probe_plot" style="width:100%;height:380px;"></div>
+        </div>
+      </div>
+      <div id="probe_notes" class="notes"></div>
+    </section>
+
+    <section class="card probe-view">
+      <h2>Touch Probe — per-touch viewer</h2>
+      <div class="meta">
+        Inspect one touch at a time (or use ← / → keys). The dashed line is
+        the detected contact position; the shaded band before it is the
+        no-contact baseline window used to tare + set the noise floor.
+      </div>
+      <div class="bd-browser">
+        <div id="probe_touch_list" class="bd-k-list"></div>
+        <div class="bd-segment-pane">
+          <div class="bd-segment-header">
+            <div class="bd-segment-nav">
+              <button id="probe_prev" type="button" title="prev touch (←)">◀</button>
+              <span id="probe_touch_label">no run loaded</span>
+              <button id="probe_next" type="button" title="next touch (→)">▶</button>
+            </div>
+          </div>
+          <div id="probe_touch_plot" style="width:100%;height:300px;"></div>
+          <div id="probe_touch_stats" class="bd-stats"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card flow-view">
+      <h2>Max Flow — results</h2>
+      <div class="meta">
+        Steady-state nozzle force vs flow rate. The fitted curve is the
+        well-behaved power law F = a·Qᵇ + c; markers show where force
+        breaks upward off it (melting limit), where per-level noise rises
+        (instability onset), and where force collapses (extruder skipping).
+        Recommended max = earliest soft breakdown, derated ~15%. The amber
+        curve (right axis) is the per-step force σ (noise) — its axis is
+        scaled to the quiet low-flow steps, so the post-skip σ explosion
+        clips off the top rather than flattening the rest; hover for true
+        values.
+      </div>
+      <div class="row" style="align-items:flex-start;">
+        <div class="result-block" style="flex:1 1 240px;">
+          <h3>Recommended max flow</h3>
+          <div id="flow_reco_display" class="big">—</div>
+          <div class="meta">mm³/s — earliest soft breakdown, derated</div>
+          <table id="flow_markers_table" class="bd-metric-table" style="margin-top:8px;"></table>
+          <div class="row" style="margin-top:8px;">
+            <button id="btn_flow_copy" type="button">Copy mm³/s</button>
+            <button id="btn_flow_export_current" type="button" title="Export this run's loadcell trace (timestamp + nozzle force) to .xlsx">Export data (XLSX)</button>
+            <span id="flow_copy_status" class="meta"></span>
+          </div>
+        </div>
+        <div class="result-block" style="flex:2 1 380px;">
+          <div id="flow_plot" style="width:100%;height:360px;"></div>
+        </div>
+      </div>
+      <div id="flow_notes" class="notes"></div>
+    </section>
+
+    <section class="card flow-view">
+      <h2>Max Flow — per-step viewer</h2>
+      <div class="meta">
+        Sanity-check that each flow level was sliced correctly. Pick a step
+        on the left (or use ← / → keys). The shaded band is the measured
+        window (the settle portion is discarded); the dashed line is the
+        steady-state force used for that point on the curve above.
+      </div>
+      <div class="bd-browser">
+        <div id="flow_level_list" class="bd-k-list"></div>
+        <div class="bd-segment-pane">
+          <div class="bd-segment-header">
+            <div class="bd-segment-nav">
+              <button id="flow_prev" type="button" title="prev step (←)">◀</button>
+              <span id="flow_level_label">no run loaded</span>
+              <button id="flow_next" type="button" title="next step (→)">▶</button>
+            </div>
+          </div>
+          <div id="flow_level_plot" style="width:100%;height:300px;"></div>
+          <div id="flow_level_stats" class="bd-stats"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card pa-view">
       <h2>bd_pressure segment browser</h2>
       <div class="meta">
         Step through every low-high-low segment (low_n + high_n + low_{n+1})
@@ -130,7 +476,7 @@
       </div>
     </section>
 
-    <section class="card">
+    <section class="card pa-view">
       <h2>Loadcell baseline (pre-sweep)</h2>
       <div class="meta">
         Held-idle window captured after heat-up, before priming. Mean is
@@ -148,7 +494,7 @@
       </div>
     </section>
 
-    <section class="card">
+    <section class="card pa-view">
       <h2>Results — bd_pressure step-response cost</h2>
       <div class="meta">
         Composite cost = weighted sum of normalised per-K metrics
@@ -161,6 +507,23 @@
           <h3>Recommended K (composite argmin)</h3>
           <div id="bd_k_opt_display" class="big">—</div>
           <div class="meta">parabolic interp around the cost minimum</div>
+          <div id="bd_annotate" class="bd-annotate" style="display:none; margin: 8px 0; padding: 8px; border: 1px dashed #2a2f37; border-radius: 4px;">
+            <div class="meta" style="margin-bottom:4px;">
+              Ground truth from your test print — used by the weight optimiser.
+            </div>
+            <div class="row" style="gap:8px; align-items:flex-end;">
+              <label style="flex: 1 1 140px;">My measured best K
+                <input id="user_k_opt_input" type="number" step="0.001" min="0" placeholder="e.g. 0.044" />
+              </label>
+              <label style="flex: 2 1 220px;">Notes
+                <input id="user_k_opt_notes" type="text" placeholder="filament, test method, date" />
+              </label>
+              <button id="btn_save_user_k" type="button">Save</button>
+              <button id="btn_clear_user_k" type="button" title="Clear the annotation on this run">Clear</button>
+            </div>
+            <div id="user_k_status" class="meta" style="margin-top:4px;"></div>
+          </div>
+          <div id="bd_weights_source_badge" class="meta" style="margin: 4px 0;"></div>
           <div class="bd-weight-sliders" id="bd_weight_sliders"></div>
           <div id="bd_cost_plot" style="width:100%;height:240px;"></div>
         </div>
@@ -171,6 +534,81 @@
         </div>
       </div>
       <div id="bd_metric_grid" class="bd-metric-grid"></div>
+    </section>
+
+    <section class="card pa-view" id="optimiser_card">
+      <h2>Weight optimiser</h2>
+      <div class="meta">
+        Tune the composite-cost weights against ground-truth K values
+        you've measured from test prints. Annotate saved runs with your
+        measured best K (the field above the weight sliders), then run
+        this to fit weights that predict those K's under bootstrap
+        resampling of the segments. Loss = bias² + α · variance summed
+        across runs.
+      </div>
+      <div class="row" style="gap: 16px; align-items: flex-end;">
+        <div>
+          <div class="meta">annotated runs available</div>
+          <div id="opt_run_count" class="big small">—</div>
+        </div>
+        <label>
+          α (bias vs stability)
+          <input id="opt_alpha" type="number" step="0.1" min="0" value="1.0" style="width: 80px;" />
+        </label>
+        <label>
+          bootstrap draws
+          <input id="opt_n_boot" type="number" step="50" min="20" max="2000" value="200" style="width: 90px;" />
+        </label>
+        <label>
+          DE maxiter
+          <input id="opt_maxiter" type="number" step="5" min="5" max="500" value="50" style="width: 80px;" />
+        </label>
+        <button id="btn_opt_run" type="button" class="primary">Run optimiser</button>
+        <button id="btn_opt_apply" type="button" disabled title="Persist the recommended weights to runs/weights_opt.json">Apply</button>
+      </div>
+      <div class="meta" style="margin-top: 8px;">
+        Metrics included in the search (uncheck to exclude a metric — its weight is locked at 0):
+      </div>
+      <div id="opt_metric_checkboxes" class="row" style="gap: 12px; flex-wrap: wrap;"></div>
+      <div id="opt_status" class="meta" style="margin-top: 8px;"></div>
+      <div id="opt_progress_wrap" style="display:none; margin-top: 6px;">
+        <progress id="opt_progress" value="0" max="1" style="width: 100%;"></progress>
+      </div>
+      <div id="opt_result" style="display:none; margin-top: 12px;">
+        <div class="row" style="gap: 16px; flex-wrap: wrap;">
+          <div><span class="meta">RMS error</span><div id="opt_rms" class="big small">—</div></div>
+          <div><span class="meta">median |Δ|</span><div id="opt_med" class="big small">—</div></div>
+          <div><span class="meta">mean bootstrap σ</span><div id="opt_mean_sigma" class="big small">—</div></div>
+          <div><span class="meta">runs used</span><div id="opt_nruns" class="big small">—</div></div>
+          <div><span class="meta">duration</span><div id="opt_duration" class="big small">—</div></div>
+        </div>
+        <h3 style="margin-top: 12px;">Per-run prediction</h3>
+        <table id="opt_per_run_table" style="width:100%;border-collapse:collapse;">
+          <thead>
+            <tr>
+              <th style="text-align:left;padding:4px 8px;border-bottom:1px solid #2a2f37;">run</th>
+              <th style="text-align:right;padding:4px 8px;border-bottom:1px solid #2a2f37;">K_user</th>
+              <th style="text-align:right;padding:4px 8px;border-bottom:1px solid #2a2f37;">K_pred</th>
+              <th style="text-align:right;padding:4px 8px;border-bottom:1px solid #2a2f37;">± σ</th>
+              <th style="text-align:right;padding:4px 8px;border-bottom:1px solid #2a2f37;">Δ</th>
+              <th style="text-align:right;padding:4px 8px;border-bottom:1px solid #2a2f37;">n_segs</th>
+            </tr>
+          </thead>
+          <tbody id="opt_per_run_body"></tbody>
+        </table>
+        <h3 style="margin-top: 12px;">Recommended weights</h3>
+        <table id="opt_weights_table" style="width:auto;border-collapse:collapse;">
+          <thead>
+            <tr>
+              <th style="text-align:left;padding:4px 12px 4px 0;border-bottom:1px solid #2a2f37;">metric</th>
+              <th style="text-align:right;padding:4px 12px;border-bottom:1px solid #2a2f37;">shipped default</th>
+              <th style="text-align:right;padding:4px 12px;border-bottom:1px solid #2a2f37;">optimised (max=1)</th>
+            </tr>
+          </thead>
+          <tbody id="opt_weights_body"></tbody>
+        </table>
+        <div id="opt_warnings" class="notes" style="margin-top: 8px;"></div>
+      </div>
     </section>
 
     <section class="card">
@@ -203,10 +641,25 @@
           <div class="meta">slope=<span id="integral_legacy_slope">—</span> · R²=<span id="integral_legacy_r2">—</span></div>
           <div id="integral_legacy_plot" style="width:100%;height:240px;"></div>
         </div>
+        <div class="result-block">
+          <h3>Signed fall-area fit (overshoot↔lag)</h3>
+          <div id="signed_k_opt" class="big">—</div>
+          <div class="meta">slope=<span id="signed_slope">—</span> · R²=<span id="signed_r2">—</span></div>
+          <div id="signed_plot" style="width:100%;height:240px;"></div>
+          <div class="meta">
+            Per-K median of <code>fall_signed_area</code> = ∫(force − baseline)
+            over the fall+recovery window. <strong>+area</strong> = force
+            lingers above baseline (slow bleed / drool → under-PA);
+            <strong>−area</strong> = force dips below (undershoot → over-PA).
+            Crosses zero at K_opt — a sign-based estimator independent of the
+            composite-cost argmin.
+          </div>
+        </div>
       </div>
       <div id="notes" class="notes"></div>
       <div class="row">
         <button id="btn_copy" type="button">Copy M572 S…</button>
+        <button id="btn_export_current" type="button" title="Export the loadcell trace shown here (timestamp + nozzle force) to .xlsx">Export data (XLSX)</button>
         <span id="copy_status" class="meta"></span>
       </div>
     </section>

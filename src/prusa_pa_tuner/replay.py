@@ -47,6 +47,11 @@ class RunInfo:
     # empty / 0 and the UI hides the line.
     filament_label: str = ""
     nozzle_temp: float = 0.0
+    # User-supplied ground-truth K (the value the user measured from a
+    # test print) and free-text notes. Set via annotate_run() after the
+    # dump is written. None when the run has never been annotated.
+    user_k_opt: float | None = None
+    user_k_opt_notes: str = ""
 
 
 def list_runs(runs_dir: str | os.PathLike = "runs") -> list[RunInfo]:
@@ -65,28 +70,55 @@ def list_runs(runs_dir: str | os.PathLike = "runs") -> list[RunInfo]:
             # stored filament_label as an object-dtype array. New NPZs
             # use a fixed-width Unicode dtype that doesn't need pickle,
             # but the flag is harmless when there's nothing to unpickle.
-            d = np.load(f, allow_pickle=True)
-            ft = d["force_t"] if "force_t" in d else np.array([])
-            pt = d["pos_t"] if "pos_t" in d else np.array([])
-            cycles = int(d["cycles_per_K"][0]) if "cycles_per_K" in d and len(d["cycles_per_K"]) else 0
-            slow_h = float(d["slow_half_s"][0]) if "slow_half_s" in d and len(d["slow_half_s"]) else 0.0
-            fast_h = float(d["fast_half_s"][0]) if "fast_half_s" in d and len(d["fast_half_s"]) else 0.0
-            n_k = int(len(d["k_values"])) if "k_values" in d else 0
-            duration = (
-                float(ft[-1] - ft[0]) if len(ft) >= 2 else 0.0
-            )
-            filament_label = ""
-            if "filament_label" in d and len(d["filament_label"]):
-                try:
-                    filament_label = str(d["filament_label"][0])
-                except Exception:
-                    filament_label = ""
-            nozzle_temp = 0.0
-            if "nozzle_temp" in d and len(d["nozzle_temp"]):
-                try:
-                    nozzle_temp = float(d["nozzle_temp"][0])
-                except Exception:
-                    nozzle_temp = 0.0
+            # `with` releases the file handle promptly; without it, an
+            # atomic rewrite by annotate_run can hit WinError 32 on
+            # Windows because numpy's NpzFile still holds the handle
+            # until GC.
+            with np.load(f, allow_pickle=True) as d:
+                ft = d["force_t"] if "force_t" in d else np.array([])
+                pt = d["pos_t"] if "pos_t" in d else np.array([])
+                cycles = (
+                    int(d["cycles_per_K"][0])
+                    if "cycles_per_K" in d and len(d["cycles_per_K"])
+                    else 0
+                )
+                slow_h = (
+                    float(d["slow_half_s"][0])
+                    if "slow_half_s" in d and len(d["slow_half_s"])
+                    else 0.0
+                )
+                fast_h = (
+                    float(d["fast_half_s"][0])
+                    if "fast_half_s" in d and len(d["fast_half_s"])
+                    else 0.0
+                )
+                n_k = int(len(d["k_values"])) if "k_values" in d else 0
+                duration = float(ft[-1] - ft[0]) if len(ft) >= 2 else 0.0
+                filament_label = ""
+                if "filament_label" in d and len(d["filament_label"]):
+                    try:
+                        filament_label = str(d["filament_label"][0])
+                    except Exception:
+                        filament_label = ""
+                nozzle_temp = 0.0
+                if "nozzle_temp" in d and len(d["nozzle_temp"]):
+                    try:
+                        nozzle_temp = float(d["nozzle_temp"][0])
+                    except Exception:
+                        nozzle_temp = 0.0
+                user_k_opt: float | None = None
+                if "user_k_opt" in d and len(d["user_k_opt"]):
+                    try:
+                        v = float(d["user_k_opt"][0])
+                        user_k_opt = v if np.isfinite(v) else None
+                    except Exception:
+                        user_k_opt = None
+                user_k_opt_notes = ""
+                if "user_k_opt_notes" in d and len(d["user_k_opt_notes"]):
+                    try:
+                        user_k_opt_notes = str(d["user_k_opt_notes"][0])
+                    except Exception:
+                        user_k_opt_notes = ""
             out.append(
                 RunInfo(
                     filename=f.name,
@@ -101,6 +133,8 @@ def list_runs(runs_dir: str | os.PathLike = "runs") -> list[RunInfo]:
                     duration_s=duration,
                     filament_label=filament_label,
                     nozzle_temp=nozzle_temp,
+                    user_k_opt=user_k_opt,
+                    user_k_opt_notes=user_k_opt_notes,
                 )
             )
         except Exception:
@@ -269,3 +303,74 @@ def replay(path: str | os.PathLike) -> tuple[SweepPlan, SweepAnalysis]:
         f"(coupled_dx_mm derived: {plan.params.coupled_dx_mm:.3f})",
     )
     return plan, analysis
+
+
+def read_annotation(
+    path: str | os.PathLike,
+) -> tuple[float | None, str]:
+    """Return `(user_k_opt, user_k_opt_notes)` for a saved run.
+
+    Either field may be absent (legacy dumps, or runs that have never
+    been annotated). `user_k_opt` is None when missing, non-finite, or
+    unparseable; notes default to empty string.
+    """
+    with np.load(path, allow_pickle=True) as d:
+        k: float | None = None
+        if "user_k_opt" in d and len(d["user_k_opt"]):
+            try:
+                v = float(d["user_k_opt"][0])
+                k = v if np.isfinite(v) else None
+            except Exception:
+                k = None
+        notes = ""
+        if "user_k_opt_notes" in d and len(d["user_k_opt_notes"]):
+            try:
+                notes = str(d["user_k_opt_notes"][0])
+            except Exception:
+                notes = ""
+    return k, notes
+
+
+def annotate_run(
+    path: str | os.PathLike,
+    user_k_opt: float | None,
+    notes: str = "",
+) -> None:
+    """Set the user-supplied ground-truth K and free-text notes on a saved run.
+
+    Re-writes the npz file: load every array, overwrite (or add) the
+    `user_k_opt` and `user_k_opt_notes` fields, atomic-rename a tmp file
+    over the original so a crash mid-write can't truncate the data.
+
+    Passing `user_k_opt=None` clears the annotation (stores NaN, which
+    `read_annotation` then reports as None).
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(p)
+
+    with np.load(p, allow_pickle=True) as d:
+        # Copy every original array into a plain dict so we can write
+        # them back. `np.load`'s NpzFile is lazy; eager-load each entry
+        # so we don't keep the file open across the rename.
+        payload = {name: np.asarray(d[name]) for name in d.files}
+
+    k_value = float("nan") if user_k_opt is None else float(user_k_opt)
+    payload["user_k_opt"] = np.array([k_value], dtype=float)
+    # Fixed-width Unicode dtype mirrors the `filament_label` convention
+    # so `np.load` without `allow_pickle` can read the file back.
+    notes_str = notes or ""
+    payload["user_k_opt_notes"] = np.array([notes_str], dtype="U512")
+
+    # np.savez auto-appends ".npz" if missing, so the tmp name must
+    # already end in ".npz" or we'd produce "<stem>.tmp.npz.npz".
+    tmp = p.parent / (p.stem + ".tmp.npz")
+    try:
+        np.savez(tmp, **payload)
+        os.replace(tmp, p)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass

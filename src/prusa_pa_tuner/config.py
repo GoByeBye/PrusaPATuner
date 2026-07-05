@@ -94,6 +94,49 @@ class AppConfig:
     first_slow_leg_factor: float = 10.0
     filament_label: str = "PLA"
 
+    # --- Max Flow test parameters ---
+    # Free-air stepped flow sweep: extrude at increasing volumetric flow
+    # rates and watch the loadcell back-pressure. min/max/step are the
+    # user-facing knobs; dwell + settle_frac + warmup are tuning defaults
+    # surfaced behind an "advanced" toggle. See flow_gen.FlowRampParams.
+    flow_min_mm3_s: float = 5.0
+    flow_max_mm3_s: float = 30.0
+    flow_step_mm3_s: float = 1.0
+    # Seconds extruded per flow level. The first `flow_settle_frac` of it is
+    # discarded so melt pressure + the accel transient settle before we
+    # measure the steady-state force + its variance. Longer = more time for
+    # the hotend to add heat and reach true thermal steady state at each
+    # level (at the cost of more filament slung into the air).
+    flow_dwell_s: float = 3.0
+    flow_settle_frac: float = 0.5
+    # Pre-sweep warm-up extrusion at min flow (s) to purge old filament and
+    # establish steady-state melt pressure before the first measured level.
+    flow_warmup_s: float = 3.0
+    # No-flow hold after the sweep-start marker, before the first level.
+    # The loadcell reading here (extruder idle) is the static head load; the
+    # analyser tares it off so the plotted force starts near 0 and reads as
+    # back-pressure above baseline.
+    flow_tare_dwell_s: float = 1.5
+
+    # --- Touch-probe (lateral characterisation) parameters ---
+    # Step 1 of the touch-probe project: push the nozzle TIP sideways into a
+    # rigid target and see whether the Z loadcell registers lateral contact.
+    # Open-loop-safe: the creep is short (`probe_creep_mm`) and slow
+    # (`probe_slow_feed_mm_min`), so even with nothing halting the move the
+    # worst case is a gentle lean, not a crash. See probe_gen.ProbeParams.
+    probe_axis: str = "X"          # "X" or "Y" -- axis the head moves along
+    probe_dir: str = "+"           # "+" or "-" -- direction toward the part
+    probe_start_x: float = 125.0   # standoff X where the slow creep begins
+    probe_start_y: float = 110.0   # standoff Y where the slow creep begins
+    probe_z: float = 5.0           # probe height (also travel Z to standoff)
+    probe_creep_mm: float = 1.0    # SLOW creep distance == hard overtravel cap
+    probe_slow_feed_mm_min: float = 30.0    # creep speed (0.5 mm/s); gentle
+    probe_travel_feed_mm_min: float = 3000.0  # rapid repositioning speed
+    probe_n_touches: int = 5       # repeats from the same standoff
+    probe_backoff_mm: float = 1.0  # retract past the standoff between touches
+    probe_settle_ms: int = 300     # hold at the standoff and at the far end
+    probe_temp: float = 0.0        # 0 => COLD probe (no heat); >0 heats first
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
