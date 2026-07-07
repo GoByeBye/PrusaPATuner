@@ -139,9 +139,52 @@ You should see `loadcell_hp`, `loadcell_value`, `loadcell_xy`, `loadcell_age` ti
 at ~100 Hz each. If it's silent, check (in order):
 
 - the printer's Metrics & Log host IP matches your host's LAN address,
-- inbound UDP/8514 is allowed by the host firewall,
+- inbound UDP/8514 is allowed by the host firewall (see the Windows trap below),
 - you're on the same subnet,
 - the four metrics are still enabled (they reset on power cycle — see above).
+
+### Windows trap: metrics stop working after a Python update
+
+If metrics used to arrive and then **silently stopped** — printer config untouched,
+app looks healthy, Diagnostics shows `packets: 0` — the most likely culprit is the
+Windows firewall, in a way that's easy to miss:
+
+- Windows firewall Allow rules are bound to the **exact .exe path** of the program.
+  The Microsoft Store Python auto-updates into a *new versioned folder*
+  (`...\PythonSoftwareFoundation.Python.3.13_3.13.XXXX.0_x64_...\python3.13.exe`),
+  so after every Python update your old "allow Python" rule no longer matches.
+- The first time the tool runs on the updated Python, Windows shows a new firewall
+  prompt. If it gets dismissed (Esc, or the popup times out unnoticed), Windows
+  creates an **enabled inbound *Block* rule** for the new python3.13.exe.
+- **Block beats Allow.** Even a correct port-based rule like "allow UDP 8514" is
+  overridden by that program-level Block rule. Every printer packet then reaches
+  your PC and dies at the firewall — while loopback tests still pass, so the app
+  itself looks fine.
+
+Diagnose it (regular PowerShell):
+
+```powershell
+Get-NetFirewallApplicationFilter | Where-Object { $_.Program -like '*python*' } |
+  ForEach-Object { $r = $_ | Get-NetFirewallRule;
+    "{0} | enabled={1} action={2} profile={3} prog={4}" -f
+      $r.DisplayName, $r.Enabled, $r.Action, $r.Profile, $_.Program }
+```
+
+Any line with `enabled=True action=Block` pointing at your current Python is the
+problem. Fix it (elevated PowerShell):
+
+```powershell
+Get-NetFirewallRule -DisplayName 'Python' |
+  Where-Object { $_.Action -eq 'Block' -and $_.Enabled -eq 'True' } |
+  Set-NetFirewallRule -Action Allow
+```
+
+(or Windows Security → Firewall & network protection → *Allow an app through
+firewall* → tick the "Python" entries). Packets should start flowing within
+seconds — watch the `packets` counter in the app's Diagnostics panel. Expect a
+repeat of this after the next Store Python auto-update; a version-independent
+inbound rule for `UDP 8514` does **not** protect you, because the per-program
+Block rule still wins.
 
 Full protocol reference: [`Prusa-Firmware-Buddy/doc/metrics.md`](https://github.com/prusa3d/Prusa-Firmware-Buddy/blob/master/doc/metrics.md).
 

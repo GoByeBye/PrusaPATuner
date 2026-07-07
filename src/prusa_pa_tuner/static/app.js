@@ -103,6 +103,35 @@ async function refreshDiagnostics() {
   $("diag_malformed").textContent = (s.malformed_lines ?? "—");
   $("diag_n_metrics").textContent = (s.metrics_seen ?? "—");
 
+  // Zero-packets triage hint. When the listener is up but literally
+  // nothing has arrived, the cause is almost never this app — surface
+  // the known culprits so the user doesn't have to rediscover them.
+  // The Windows-firewall one is nasty: Store Python auto-updates move
+  // python3.13.exe to a new versioned path, the new firewall prompt
+  // gets dismissed, and the resulting per-program BLOCK rule silently
+  // overrides any port-based allow rule (loopback still works, so the
+  // app looks healthy). See README "Windows trap" for the fix.
+  const zeroHint = $("diag_zero_hint");
+  if (zeroHint) {
+    if ((s.packets || 0) === 0) {
+      zeroHint.style.display = "";
+      zeroHint.innerHTML =
+        "<strong>No UDP packets have arrived at all.</strong> The listener is up — " +
+        "the problem is upstream. Check, in order:<br>" +
+        "1. Printer: Settings → Network → Metrics &amp; Log — <em>Enable Metrics</em> on, " +
+        "Host = this PC's IP, ports 8514. (Resets on printer power-cycle.)<br>" +
+        "2. <strong>Windows firewall</strong>: a Microsoft Store Python auto-update moves " +
+        "<code>python3.13.exe</code> to a new path; dismissing the new firewall prompt creates " +
+        "an enabled inbound <em>Block</em> rule that overrides every port-based allow rule. " +
+        "Fix in elevated PowerShell: <code>Get-NetFirewallRule -DisplayName 'Python' | " +
+        "Where-Object { $_.Action -eq 'Block' -and $_.Enabled -eq 'True' } | " +
+        "Set-NetFirewallRule -Action Allow</code> — details in the README.<br>" +
+        "3. Same subnet: printer and PC should be on the same /24.";
+    } else {
+      zeroHint.style.display = "none";
+    }
+  }
+
   // Sort metrics by rate descending; ties broken by total samples.
   const names = Object.keys(rates);
   // The /api/metrics_seen endpoint also surfaces names without rate; pull
