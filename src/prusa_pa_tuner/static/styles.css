@@ -157,6 +157,12 @@ button.danger { color: var(--danger); }
   color: var(--muted);
 }
 
+.meta a {
+  color: #58a6ff;
+  text-decoration: none;
+}
+.meta a:hover { text-decoration: underline; }
+
 .notes {
   margin-top: 12px;
   font-size: 12px;
@@ -190,7 +196,28 @@ pre {
   font-size: 13px;
 }
 
-/* ---- bd_pressure segment browser ---- */
+/* ---- provenance badges ----
+   Small tags next to card/panel headlines marking where an algorithm
+   comes from: ported from markniu/bd_pressure, ported from Snapmaker U1,
+   or original to this project. h2 is uppercase-transformed, so reset it. */
+.src-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: none;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.src-bd  { background: rgba(163, 113, 247, 0.12); color: #a371f7; border: 1px solid #6e40a5; }
+.src-u1  { background: rgba(88, 166, 255, 0.12);  color: #58a6ff; border: 1px solid #1f6feb; }
+.src-own { background: rgba(46, 160, 67, 0.12);   color: #3fb950; border: 1px solid #2ea043; }
+
+/* ---- segment browser (bd-* classes: step-response viewer, layout shared
+        by the Max Flow / Touch Probe per-step viewers) ---- */
 .bd-browser {
   display: grid;
   grid-template-columns: 200px 1fr;

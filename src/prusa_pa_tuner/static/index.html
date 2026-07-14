@@ -452,10 +452,15 @@
     </section>
 
     <section class="card pa-view">
-      <h2>bd_pressure segment browser</h2>
+      <h2>Segment browser — step-response regions
+        <span class="src-badge src-bd">ported: markniu/bd_pressure</span></h2>
       <div class="meta">
         Step through every low-high-low segment (low_n + high_n + low_{n+1})
-        and inspect what the analyser saw. Click a K on the left to focus it;
+        and inspect what the analyser saw. The 8-region step-response
+        decomposition (R1 baseline … R8 recovery tail) is adapted from
+        <a href="https://github.com/markniu/bd_pressure" target="_blank" rel="noopener">markniu's
+        bd_pressure</a> Klipper module, re-run offline on the Prusa loadcell
+        stream. Click a K on the left to focus it;
         use prev/next buttons or ← / → keys to step through that K's segments.
         Segments excluded by the auto-quality gate are flagged with the reason.
       </div>
@@ -504,12 +509,17 @@
     </section>
 
     <section class="card pa-view">
-      <h2>Results — bd_pressure step-response cost</h2>
+      <h2>Results — composite step-response cost
+        <span class="src-badge src-bd">metrics: markniu/bd_pressure</span>
+        <span class="src-badge src-own">weighting: this project</span></h2>
       <div class="meta">
-        Composite cost = weighted sum of normalised per-K metrics
-        (median over included segments). Sliders adjust weights live —
-        K_opt recomputes without re-running the printer. The per-metric
-        K_opts on the right show whether the metrics agree.
+        Composite cost = weighted sum of normalised per-K step-response
+        metrics (median over included segments). The per-segment metrics
+        follow bd_pressure's transient decomposition; the live re-weightable
+        composite and the weight optimiser below are this project's
+        extension. Sliders adjust weights live — K_opt recomputes without
+        re-running the printer. The per-metric K_opts on the right show
+        whether the metrics agree.
       </div>
       <div class="row" style="align-items:flex-start;">
         <div class="result-block" style="flex:2 1 360px;">
@@ -546,7 +556,8 @@
     </section>
 
     <section class="card pa-view" id="optimiser_card">
-      <h2>Weight optimiser</h2>
+      <h2>Weight optimiser
+        <span class="src-badge src-own">this project</span></h2>
       <div class="meta">
         Tune the composite-cost weights against ground-truth K values
         you've measured from test prints. Annotate saved runs with your
@@ -621,12 +632,17 @@
     </section>
 
     <section class="card pa-view">
-      <h2>Results — fit zero-crossing (comparison)</h2>
+      <h2>Results — zero-crossing fits (comparison)</h2>
       <div class="meta">
-        U1/Snapmaker-style metrics. The integral-area fit uses a 150 ms
-        transition window (≈ one melt-pressure τ) and a per-cycle local
-        mean, and now consumes the SAME bd_pressure-built cycle list, so
-        a cycle the bd analysis excluded (dropouts in the critical zone,
+        Alternative K_opt estimators to cross-check the composite cost
+        above; each panel is tagged with its origin. The integral-area fits
+        port the <a href="https://github.com/Snapmaker/u1-klipper/blob/main/klippy/extras/flow_calibrator.py"
+        target="_blank" rel="noopener">Snapmaker U1 flow-calibrator</a> math
+        (150 ms transition window ≈ one melt-pressure τ, per-cycle local
+        mean); phase-lag and signed fall-area are this project's own
+        estimators (phase-lag follows the Ellis 3DP under/over-PA framing).
+        All fits consume the SAME cycle list as the step-response analysis
+        above, so a cycle it excluded (dropouts in the critical zone,
         sample rate &lt; 40 Hz, signal-below-noise) is excluded here too.
         Hover a point to see how many cycles survived for that K. Phase-lag
         and legacy-integral are kept for visual comparison only. The
@@ -637,25 +653,29 @@
       </div>
       <div class="row">
         <div class="result-block">
-          <h3>Phase-lag fit</h3>
+          <h3>Phase-lag fit
+            <span class="src-badge src-own">this project</span></h3>
           <div id="phase_k_opt" class="big">—</div>
           <div class="meta">model=<span id="phase_fit_kind">—</span> · R²=<span id="phase_r2">—</span></div>
           <div id="phase_plot" style="width:100%;height:240px;"></div>
         </div>
         <div class="result-block">
-          <h3>Integral-area fit (centered)</h3>
+          <h3>Integral-area fit (centered)
+            <span class="src-badge src-u1">ported: Snapmaker U1</span></h3>
           <div id="integral_k_opt" class="big">—</div>
           <div class="meta">slope=<span id="integral_slope">—</span> · R²=<span id="integral_r2">—</span></div>
           <div id="integral_plot" style="width:100%;height:240px;"></div>
         </div>
         <div class="result-block">
-          <h3>Integral (legacy sign(dC/dt))</h3>
+          <h3>Integral (legacy sign(dC/dt))
+            <span class="src-badge src-u1">Snapmaker U1 · original form</span></h3>
           <div id="integral_legacy_k_opt" class="big">—</div>
           <div class="meta">slope=<span id="integral_legacy_slope">—</span> · R²=<span id="integral_legacy_r2">—</span></div>
           <div id="integral_legacy_plot" style="width:100%;height:240px;"></div>
         </div>
         <div class="result-block">
-          <h3>Signed fall-area fit (overshoot↔lag)</h3>
+          <h3>Signed fall-area fit (overshoot↔lag)
+            <span class="src-badge src-own">this project</span></h3>
           <div id="signed_k_opt" class="big">—</div>
           <div class="meta">slope=<span id="signed_slope">—</span> · R²=<span id="signed_r2">—</span></div>
           <div id="signed_plot" style="width:100%;height:240px;"></div>

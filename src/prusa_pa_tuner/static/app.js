@@ -1318,7 +1318,7 @@ function renderRun(run) {
   // survived for each K.
   const integralCounts = a.per_k.map((r) => {
     const inc = r.integral_n_included, tot = r.integral_n_total;
-    return tot > 0 ? `${inc}/${tot} cycles included` : "no bd cycles built";
+    return tot > 0 ? `${inc}/${tot} cycles included` : "no cycles built";
   });
 
   plotFit("phase_plot", k, lag, a.phase_fit, "lag (ms)");
@@ -1397,13 +1397,13 @@ async function copyPressureAdvance() {
   const bdK = bdState.analysis ? bdState.analysis.bd_k_opt : null;
   if (bdK !== null && bdK !== undefined && Number.isFinite(bdK)) {
     k = bdK;
-    source = "bd_pressure";
+    source = "composite-cost";
   } else if (a.phase_fit && a.phase_fit.k_opt !== null) {
     k = a.phase_fit.k_opt;
-    source = "phase";
+    source = "phase-lag";
   } else if (a.integral_fit && a.integral_fit.k_opt !== null) {
     k = a.integral_fit.k_opt;
-    source = "integral";
+    source = "integral-area";
   }
   if (k === null) {
     flash($("btn_copy"), "No K_opt");
