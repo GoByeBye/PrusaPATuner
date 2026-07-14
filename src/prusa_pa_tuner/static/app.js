@@ -2510,15 +2510,18 @@ const lmap = {
   reviewFile: null,    // saved npz filename when mode === 'review'
   geomCache: {},       // layerIdx -> polylines (pending/live backdrop)
   reviewCache: {},     // layerIdx -> {polylines, points} (saved-run review)
-  // Live accumulation: ONE time-ordered toolhead path (x,y,force). We no
-  // longer split by pos_z -- on this hardware pos_z carries MBL/raw-encoder
-  // noise (±168 mm) and mis-assigns layers. Live shows the full path as a
-  // connected force-coloured line; per-layer detail comes from the saved-run
-  // review (server arc-length matched to the gcode).
-  livePath: { x: [], y: [], force: [] },
+  // Live accumulation: per-layer toolhead paths (x,y,force), keyed by layer
+  // index. Raw pos_z carries MBL/raw-encoder junk spikes (±168 mm), but a
+  // rolling MEDIAN recovers the true z staircase (same trick the offline
+  // mapper uses), so the live layer is tracked causally from median pos_z and
+  // each sample lands in its own layer's bucket. Per-layer detail with
+  // travel/feature masking still comes from the saved-run review.
+  livePaths: {},       // layerIdx -> {x, y, force, stride, seen}
+  liveSeen: 0,         // total force samples placed (across all layers)
+  zTrack: { win: [], cand: 0, run: 0, pitch: 0.3 },
   posX: { t: [], v: [] }, posY: { t: [], v: [] }, posZ: { t: [], v: [] },
   posCap: 6000,        // rolling cap on each position buffer
-  ptCap: 60000,        // cap on the accumulated live path
+  ptCap: 60000,        // per-layer point cap; the bucket THINS 2x when full
   curLayer: 0,
   liveLayer: 0,
   followLive: true,
@@ -2529,7 +2532,9 @@ const lmap = {
 };
 
 function lmResetLive() {
-  lmap.livePath = { x: [], y: [], force: [] };
+  lmap.livePaths = {};
+  lmap.liveSeen = 0;
+  lmap.zTrack = { win: [], cand: 0, run: 0, pitch: _lmLayerPitch() };
   lmap.posX = { t: [], v: [] };
   lmap.posY = { t: [], v: [] };
   lmap.posZ = { t: [], v: [] };
@@ -2567,6 +2572,59 @@ function lmLayerOfZ(z) {
   return best;
 }
 
+function _median(a) {
+  const b = a.slice().sort((x, y) => x - y);
+  const m = b.length >> 1;
+  return b.length % 2 ? b[m] : 0.5 * (b[m - 1] + b[m]);
+}
+
+function _lmLayerPitch() {
+  const zs = (lmap.summary && lmap.summary.layer_zs) || [];
+  const d = [];
+  for (let i = 1; i < zs.length; i++) d.push(zs[i] - zs[i - 1]);
+  const m = d.length ? _median(d) : 0;
+  return m > 0.02 ? m : 0.3;
+}
+
+// Live layer detection from pos_z (mirrors the offline mapper's staircase
+// idea, but causal): a rolling median over the last ~51 raw samples kills the
+// ±168 mm junk spikes, the nearest gcode layer z is the candidate, and the
+// candidate must hold for LM_Z_CONFIRM consecutive samples before we switch.
+// Medians far off the staircase (pre-print travels, MBL probing) are ignored.
+const LM_Z_WIN = 51;       // rolling-median window (~0.65 s at 78 Hz)
+const LM_Z_MIN = 25;       // don't trust the median before this many samples
+const LM_Z_CONFIRM = 20;   // consecutive agreeing samples to switch layer
+
+function _lmTrackLayerZ(z) {
+  if (!Number.isFinite(z) || !lmap.summary) return;
+  const zt = lmap.zTrack;
+  zt.win.push(z);
+  if (zt.win.length > LM_Z_WIN) zt.win.shift();
+  if (zt.win.length < LM_Z_MIN) return;
+  const med = _median(zt.win);
+  const cand = lmLayerOfZ(med);
+  const zs = lmap.summary.layer_zs || [];
+  // off the staircase (way above/below any layer): pre-print moves, junk
+  if (Math.abs((zs[cand] ?? med) - med) > Math.max(0.6 * zt.pitch, 0.3)) return;
+  if (cand === lmap.liveLayer) { zt.cand = cand; zt.run = 0; return; }
+  zt.run = (cand === zt.cand) ? zt.run + 1 : 1;
+  zt.cand = cand;
+  if (zt.run >= LM_Z_CONFIRM) {
+    zt.run = 0;
+    if (cand < lmap.liveLayer) {
+      // z only ever rises in a real print, so a confirmed downward move means
+      // the earlier upward step was pre-print junk (e.g. the MBL travel
+      // height sitting near a layer z) -- discard what was mis-bucketed.
+      for (const k of Object.keys(lmap.livePaths)) {
+        if (Number(k) > cand) delete lmap.livePaths[k];
+      }
+    }
+    lmap.liveLayer = cand;
+    if (lmap.followLive) { lmap.curLayer = cand; _lmSyncSlider(); }
+    lmapRequestRender();
+  }
+}
+
 function lmapIngestPos(axis, ts, vs) {
   if (lmap.mode !== "live" || !lmap.summary) return;
   if (!Array.isArray(ts) || !Array.isArray(vs)) return;
@@ -2576,6 +2634,7 @@ function lmapIngestPos(axis, ts, vs) {
     // keep strictly increasing time (server already clips, but be safe)
     if (buf.t.length && ts[i] <= buf.t[buf.t.length - 1]) continue;
     buf.t.push(ts[i]); buf.v.push(vs[i]);
+    if (axis === "z") _lmTrackLayerZ(vs[i]);
   }
   if (buf.t.length > lmap.posCap) {
     const drop = buf.t.length - lmap.posCap;
@@ -2583,17 +2642,32 @@ function lmapIngestPos(axis, ts, vs) {
   }
 }
 
+function _lmLiveBucket(layerIdx) {
+  let b = lmap.livePaths[layerIdx];
+  if (!b) b = lmap.livePaths[layerIdx] = { x: [], y: [], force: [], stride: 1, seen: 0 };
+  return b;
+}
+
 function lmapIngestForce(ts, vs) {
   if (lmap.mode !== "live" || !lmap.summary) return;
-  const path = lmap.livePath;
   const n = Math.min(ts.length, vs.length);
   for (let i = 0; i < n; i++) {
     const t = ts[i];
     const x = _lerpAt(t, lmap.posX.t, lmap.posX.v);
     const y = _lerpAt(t, lmap.posY.t, lmap.posY.v);
     if (x === null || y === null) continue;  // no position yet
-    if (path.x.length < lmap.ptCap) {
-      path.x.push(x); path.y.push(y); path.force.push(vs[i]);
+    const b = _lmLiveBucket(lmap.liveLayer);
+    b.seen++;
+    lmap.liveSeen++;
+    // Bounded memory WITHOUT stopping: once a layer's bucket is full, thin it
+    // to every 2nd point and halve the ingest rate (stride) -- the shape stays,
+    // recording continues for arbitrarily long layers.
+    if ((b.seen - 1) % b.stride) continue;
+    b.x.push(x); b.y.push(y); b.force.push(vs[i]);
+    if (b.x.length >= lmap.ptCap) {
+      const keep = (_, j) => (j & 1) === 0;
+      b.x = b.x.filter(keep); b.y = b.y.filter(keep); b.force = b.force.filter(keep);
+      b.stride *= 2;
     }
   }
   lmapRequestRender();
@@ -2899,8 +2973,12 @@ async function lmapRender() {
         : "no mapped samples on this layer.";
     }
   } else {
-    // LIVE: full accumulating toolhead path, coloured by raw load.
-    const path = lmap.livePath;
+    // LIVE: the selected layer's accumulated toolhead path, coloured by raw
+    // load, over that layer's gcode backdrop. The printing layer is tracked
+    // from the pos_z rolling median; follow-live keeps L on it.
+    const geo = await lmapGeometry(L);
+    traces.push(..._lmBackdropFaint((geo && geo.polylines) || []));
+    const path = lmap.livePaths[L] || { x: [], y: [], force: [] };
     let amin = _percentile(path.force, 2), amax = _percentile(path.force, 98);
     if (amin === null) { amin = 0; amax = 1; }
     const { cmin, cmax } = _lmScaleRange(amin, amax);
@@ -2908,9 +2986,15 @@ async function lmapRender() {
       traces.push(..._lmLivePathTraces(path, cmin, cmax));
       traces.push(_lmColorbarTrace(cmin, cmax));
     }
-    legendTxt = path.x.length
-      ? "live: full toolhead path coloured by raw load — per-layer review opens when the run finishes"
-      : "waiting for nozzle-force + position telemetry…";
+    if (!lmap.liveSeen) {
+      legendTxt = "waiting for nozzle-force + position telemetry…";
+    } else {
+      const noZ = lmap.posZ.t.length === 0;
+      legendTxt =
+        `live: toolhead path coloured by raw load · printing layer ${lmap.liveLayer + 1}` +
+        (noZ ? " · ⚠ no pos_z telemetry — layer changes can't be detected" : "") +
+        " — per-layer review opens when the run finishes";
+    }
   }
 
   const [bx0, bx1, by0, by1] = lmap.summary.bbox || [0, 1, 0, 1];
@@ -2940,8 +3024,12 @@ async function lmapRender() {
       `layer ${L + 1}/${lmap.summary.n_layers}` +
       (z !== undefined ? ` · z=${Number(z).toFixed(2)} mm` : "") + ` · ${npts} samples`;
   } else {
+    const npts = (lmap.livePaths[L] || { x: [] }).x.length;
     $("lm_layer_label").textContent =
-      `live · ${lmap.livePath.x.length} samples` + (lmap.followLive ? " · ● recording" : "");
+      `live · layer ${L + 1}/${lmap.summary.n_layers}` +
+      (z !== undefined ? ` · z=${Number(z).toFixed(2)} mm` : "") +
+      ` · ${npts} pts (${lmap.liveSeen} total)` +
+      (lmap.followLive ? " · ● following print" : " · ⏸ pinned — Jump to live to resume");
   }
   $("lm_legend").textContent = legendTxt;
 }
