@@ -962,46 +962,67 @@ def _slice_from_pos_transitions(
     # last sample where pos_x sits within motion_threshold of baseline_x
     # is the latest moment the toolhead was idle. The very next sample
     # is when motion started.
-    search_lo = first_plus_t - 60.0  # cap the search at 60 s before
+    #
+    # The search window reaches back to the sweep-start anchor, NOT a
+    # fixed horizon. The K[0] warm-up slow leg is planned as
+    # `first_slow_leg_factor × slow_half_s`, but the firmware does not
+    # honour ultra-low composite feedrates: on the user's
+    # run_1784014161 (coupled_dx=0.4 mm, factor=10 → F1.2 mm/min) the
+    # planned 20 s warm-up leg actually took ~260 s, so the first +1
+    # transition sat 4+ minutes after motion onset and the previous
+    # fixed 60 s backscan never reached the idle baseline. The slicer
+    # then bailed to plan-direct windows -- which misalign for exactly
+    # the same reason (plan timing ≠ firmware timing). The slow leg
+    # cannot begin before the sweep anchor, so
+    # [anchor − 1 cycle, first_plus_t] always contains the motion
+    # onset regardless of the sweep parameters used.
+    search_lo = min(first_plus_t - 60.0, sweep_t0_estimate - period)
     pre_mask = (pos_t_arr >= search_lo) & (pos_t_arr <= first_plus_t)
     pre_idxs = np.where(pre_mask)[0]
-    if len(pre_idxs) < 5:
+    k0_slow_start_abs: float | None = None
+    if len(pre_idxs) >= 5:
+        # Find the LAST index where pos_x was within motion_threshold
+        # of baseline_x.
+        at_baseline = (
+            np.abs(pos_x_arr[pre_idxs] - baseline_x) <= motion_threshold
+        )
+        if at_baseline.any():
+            last_idle_local = int(np.where(at_baseline)[0][-1])
+            last_idle_global = int(pre_idxs[last_idle_local])
+            # The slow leg onset is somewhere between this idle sample
+            # and the next sample (which is above motion_threshold).
+            if last_idle_global + 1 < len(pos_t_arr):
+                t_idle = float(pos_t_arr[last_idle_global])
+                t_next = float(pos_t_arr[last_idle_global + 1])
+                v_idle = float(pos_x_arr[last_idle_global])
+                v_next = float(pos_x_arr[last_idle_global + 1])
+                if v_next != v_idle:
+                    crossing = baseline_x + motion_threshold
+                    frac = (crossing - v_idle) / (v_next - v_idle)
+                    frac = max(0.0, min(1.0, frac))
+                    k0_slow_start_abs = t_idle + frac * (t_next - t_idle)
+                else:
+                    k0_slow_start_abs = 0.5 * (t_idle + t_next)
+            else:
+                k0_slow_start_abs = float(pos_t_arr[last_idle_global])
+    if k0_slow_start_abs is None:
+        # Backscan couldn't find the idle baseline (sparse pos stream,
+        # or pos_x genuinely never settled). The transition-derived
+        # windows for K[0]'s END and all of K[1..] are still valid --
+        # they come straight from detected toolhead reversals -- so
+        # don't throw them away. Approximate K[0]'s start with the
+        # anchor's prediction (warm-up begins `start_offset_s` after
+        # sweep_t0) instead of bailing to fully plan-direct windows.
+        k0_slow_start_abs = float(
+            sweep_t0_estimate + plan.segments[0].start_offset_s
+        )
         if notes is not None:
             notes.append(
-                "pos_x transitions: too few samples in 60 s before first +1 "
-                "transition -- falling through to next slicer"
+                f"pos_x transitions: K[0] motion-onset backscan found no "
+                f"idle sample within {motion_threshold:.3f} mm of baseline "
+                f"{baseline_x:.3f} -- using the anchor's predicted K[0] "
+                f"start; K window ends still come from detected transitions"
             )
-        return None
-    # Find the LAST index where pos_x was within motion_threshold of baseline_x.
-    at_baseline = (
-        np.abs(pos_x_arr[pre_idxs] - baseline_x) <= motion_threshold
-    )
-    if not at_baseline.any():
-        if notes is not None:
-            notes.append(
-                f"pos_x transitions: pos_x never settled within "
-                f"{motion_threshold:.3f} mm of baseline {baseline_x:.3f} "
-                f"in 60 s before the first +1 -- falling through to next slicer"
-            )
-        return None
-    last_idle_local = int(np.where(at_baseline)[0][-1])
-    last_idle_global = int(pre_idxs[last_idle_local])
-    # The slow leg onset is somewhere between this idle sample and the
-    # next sample (which is above motion_threshold).
-    if last_idle_global + 1 < len(pos_t_arr):
-        t_idle = float(pos_t_arr[last_idle_global])
-        t_next = float(pos_t_arr[last_idle_global + 1])
-        v_idle = float(pos_x_arr[last_idle_global])
-        v_next = float(pos_x_arr[last_idle_global + 1])
-        if v_next != v_idle:
-            crossing = baseline_x + motion_threshold
-            frac = (crossing - v_idle) / (v_next - v_idle)
-            frac = max(0.0, min(1.0, frac))
-            k0_slow_start_abs = t_idle + frac * (t_next - t_idle)
-        else:
-            k0_slow_start_abs = 0.5 * (t_idle + t_next)
-    else:
-        k0_slow_start_abs = float(pos_t_arr[last_idle_global])
 
     # Refine sweep_t0 from the detected K[0] slow leg start.
     refined_t0 = k0_slow_start_abs - plan.segments[0].start_offset_s
@@ -1126,6 +1147,7 @@ def _detect_z_marker_anchor(
     pos_z_t: np.ndarray,
     pos_z: np.ndarray,
     expected_lift_mm: float = 2.0,
+    expected_base_z_mm: float | None = None,
 ) -> float | None:
     """Find the host-clock time the toolhead returned to baseline after
     the sweep's pre-burst Z marker pulse.
@@ -1148,6 +1170,22 @@ def _detect_z_marker_anchor(
     3. From there, find the first sample where pos_z is back within
        `0.3·expected_lift_mm` of the baseline. Linearly interpolate the
        threshold crossing for sub-sample precision.
+
+    Two false-positive gates (user's flow_1784020430, 2026-07-14:
+    homing PROBE TAPS — a slow ~1.7 mm descent, quick pop back up,
+    descend again — matched the lift+return signature almost exactly
+    and anchored the sweep 59 s early, before the heater even
+    finished):
+
+    * **Baseline gate** — the marker is always emitted at the purge
+      height. When the caller knows it (`expected_base_z_mm`,
+      = plan purge_z), candidates whose local baseline is more than
+      1 mm away are rejected outright. Probe taps happen near Z≈0
+      / negative; the purge sits at 50-80 mm.
+    * **Post-return settle gate** — after the marker's Z-down the
+      toolhead DWELLS at the purge height (pre-roll / tare hold), so
+      pos_z must stay near baseline for ~1 s after the return. Probe
+      taps immediately descend again and fail this.
 
     Returns the host-clock timestamp of the return, or None when no
     Z bump of the expected magnitude is found (older gcode without
@@ -1177,9 +1215,12 @@ def _detect_z_marker_anchor(
                         # baseline estimate
     SETTLE_PP_MM = 0.5  # lookback must be settled to this PP for a valid baseline
     RETURN_WINDOW_S = 1.5  # marker must return to baseline within this
+    POST_SETTLE_S = 1.0  # ... and STAY at baseline for this long after
+    BASE_Z_TOL_MM = 1.0  # baseline gate tolerance vs expected_base_z_mm
     lookback_n = max(5, int(round(LOOKBACK_S / dt_med)))
     guard_n = max(1, int(round(GUARD_S / dt_med)))
     return_n = max(10, int(round(RETURN_WINDOW_S / dt_med)))
+    post_n = max(5, int(round(POST_SETTLE_S / dt_med)))
     lift_threshold_rel = 0.5 * expected_lift_mm
     return_threshold_rel = 0.3 * expected_lift_mm
 
@@ -1190,6 +1231,11 @@ def _detect_z_marker_anchor(
         if lb_max - lb_min > SETTLE_PP_MM:
             continue  # lookback not settled — could be homing or motion
         local_baseline = float(np.median(lookback))
+        if (
+            expected_base_z_mm is not None
+            and abs(local_baseline - expected_base_z_mm) > BASE_Z_TOL_MM
+        ):
+            continue  # not at the purge height — probe tap / park / homing
         if float(pos_z[i]) <= local_baseline + lift_threshold_rel:
             continue
         # Candidate lift. Find the first sample within RETURN_WINDOW_S
@@ -1198,6 +1244,18 @@ def _detect_z_marker_anchor(
         return_thr = local_baseline + return_threshold_rel
         for j in range(i + 1, look_end):
             if float(pos_z[j]) < return_thr:
+                # Post-return settle gate: the toolhead dwells at the
+                # purge height after the marker, so pos_z must remain
+                # near baseline. A probe tap's pop-up returns just as
+                # fast but immediately descends again — reject it and
+                # keep scanning for the real marker.
+                post = pos_z[j:j + post_n]
+                if (
+                    len(post) >= 5
+                    and float(np.max(np.abs(post - local_baseline)))
+                    > return_threshold_rel + 0.2
+                ):
+                    break  # not a marker — abandon this candidate
                 t0, t1 = float(pos_z_t[j - 1]), float(pos_z_t[j])
                 v0, v1 = float(pos_z[j - 1]), float(pos_z[j])
                 if v1 != v0:
@@ -1384,6 +1442,7 @@ def resolve_anchor_and_windows(
     ):
         z_return_t = _detect_z_marker_anchor(
             pos_z_t, pos_z, expected_lift_mm=z_marker_lift_mm,
+            expected_base_z_mm=plan.params.purge_z,
         )
         if z_return_t is not None:
             # Gcode-side contract: the Z marker pulse ends with pos_z

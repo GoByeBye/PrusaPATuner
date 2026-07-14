@@ -2310,6 +2310,71 @@ def test_z_marker_skips_sentinel_pos_z_prefix():
     )
 
 
+def test_z_marker_rejects_homing_probe_taps():
+    """User report flow_1784020430 (2026-07-14): homing PROBE TAPS --
+    a slow ~1.7 mm descent, quick ~1.9 mm pop back up, descend again --
+    matched the marker detector's lift+return signature and anchored
+    the sweep 59 s early (mid heat-up), which the flow analyser's
+    Z-marker override then trusted over the CORRECT force-activity
+    anchor. Every level window landed on dead pre-sweep data.
+
+    Two gates must reject the taps:
+      * baseline gate -- the marker is emitted at the purge height
+        (`expected_base_z_mm`); taps happen near Z≈0.
+      * post-return settle gate -- after the marker the toolhead dwells
+        at baseline; a tap's pop-up immediately descends again.
+    """
+    from prusa_pa_tuner.analysis import _detect_z_marker_anchor
+
+    sr = 50.0
+    dt = 1.0 / sr
+    purge_z = 80.0
+
+    chunks = []
+    # 3 probe taps: settled hold at 0, quick pop to +1.9, immediate
+    # slow descent to -1.7 (the next probing move), pop again ...
+    for _ in range(3):
+        chunks += [
+            np.full(int(2.0 * sr), 0.0),            # settled at 0
+            np.linspace(0.0, 1.9, int(0.1 * sr)),   # quick pop up
+            np.linspace(1.9, 0.0, int(0.15 * sr)),  # quick return
+            np.linspace(0.0, -1.7, int(1.5 * sr)),  # descend again (tap)
+            np.linspace(-1.7, 0.0, int(0.1 * sr)),  # back up
+        ]
+    # travel to purge height, settle, real marker, post-marker dwell
+    chunks += [
+        np.linspace(0.0, purge_z, int(2.0 * sr)),
+        np.full(int(3.0 * sr), purge_z),
+        np.linspace(purge_z, purge_z + 2.0, int(0.15 * sr)),
+        np.full(int(0.1 * sr), purge_z + 2.0),
+        np.linspace(purge_z + 2.0, purge_z, int(0.15 * sr)),
+        np.full(int(3.0 * sr), purge_z),
+    ]
+    pos_z = np.concatenate(chunks)
+    pos_z_t = np.arange(len(pos_z)) * dt
+    # true marker return = end of the drop ramp (last 3s hold start)
+    true_return_t = (len(pos_z) - int(3.0 * sr)) * dt
+
+    # With the purge-height hint, the taps must be skipped outright.
+    r = _detect_z_marker_anchor(
+        pos_z_t, pos_z, expected_lift_mm=2.0, expected_base_z_mm=purge_z,
+    )
+    assert r is not None, "real marker at purge height not found"
+    assert abs(r - true_return_t) < 0.2, (
+        f"anchor at {r:.2f}s, expected real marker at ~{true_return_t:.2f}s"
+    )
+
+    # Even WITHOUT the hint (legacy callers), the post-return settle
+    # gate alone must reject the taps: the pop-up's return is followed
+    # by immediate motion, not a dwell.
+    r2 = _detect_z_marker_anchor(pos_z_t, pos_z, expected_lift_mm=2.0)
+    assert r2 is not None
+    assert abs(r2 - true_return_t) < 0.2, (
+        f"anchor at {r2:.2f}s locked onto a probe tap, expected "
+        f"~{true_return_t:.2f}s"
+    )
+
+
 def test_pos_transitions_emit_at_actual_extremum_not_detection_time():
     """Regression for the lag the user spotted in 2026-05: an earlier
     sticky-anchor implementation only committed direction after pos_x
@@ -2903,6 +2968,113 @@ def test_pos_x_transition_slicer_recovers_from_firmware_delay():
                 f"K={seg.k} span {t_hi - t_lo:.3f} expected "
                 f"{seg.duration_s:.3f}"
             )
+
+
+def test_pos_x_transition_slicer_survives_stretched_warmup_leg():
+    """User report run_1784014161 (2026-07-14): with coupled_dx=0.4 mm
+    and first_slow_leg_factor=10, the warm-up slow leg is commanded at
+    F1.2 mm/min -- and Buddy does NOT execute such ultra-low composite
+    feedrates at the commanded speed. The planned 20 s warm-up leg
+    actually took ~260 s, so the first pos_x peak sat 4+ minutes after
+    motion onset. The old K[0] motion-onset backscan only searched a
+    fixed 60 s before the first +1 transition, never reached the idle
+    baseline, and bailed -- dropping the run to plan-direct windows
+    that were misaligned by the same ~240 s.
+
+    The backscan must instead reach back to the sweep anchor: the slow
+    leg cannot begin before sweep_t0, and that bound holds regardless
+    of the sweep parameters used.
+
+    Test: plant pos_x ramps where the warm-up slow leg runs 13× slower
+    than the plan predicts (everything after it on plan pace, shifted
+    by the stretch). Verify the slicer succeeds and every K window
+    lands on the actual planted legs, not the plan's schedule.
+    """
+    from prusa_pa_tuner.analysis import _slice_from_pos_transitions
+
+    params = SweepParams(
+        K_values=(0.0, 0.01, 0.02, 0.03, 0.04, 0.05),
+        cycles_per_K=1,
+        slow_half_s=2.0,
+        fast_half_s=2.0 / 3.0,
+        coupled_dx_mm=0.4,
+        first_slow_leg_factor=10.0,
+        purge_x=30.0, purge_y=30.0, purge_z=50.0,
+    )
+    plan = build_sweep(params)
+    sweep_t0 = 1000.0  # Z-marker anchored time
+    stretch = 13.0     # firmware ran the warm-up leg this much slower
+    warmup_slow_planned = params.slow_half_s * params.first_slow_leg_factor
+    extra = warmup_slow_planned * (stretch - 1.0)
+    pos_rate = 50.0
+    pre_s = 5.0
+    total_s = (
+        plan.segments[-1].start_offset_s
+        + plan.segments[-1].duration_s
+        + extra
+        + 4.0
+    )
+    n = int((pre_s + total_s) * pos_rate)
+    pos_rel = np.arange(n) / pos_rate - pre_s
+    pos_t = sweep_t0 + pos_rel
+    pos_x = np.full(n, params.purge_x)
+
+    def ramp(t_start: float, t_end: float, x_from: float, x_to: float):
+        m = (pos_rel >= t_start) & (pos_rel < t_end)
+        f = (pos_rel[m] - t_start) / max(t_end - t_start, 1e-9)
+        pos_x[m] = x_from + (x_to - x_from) * f
+
+    top_x = params.purge_x + params.coupled_dx_mm
+    # K[0]: warm-up slow leg stretched 13x, fast leg on pace.
+    k0_slow_start = plan.segments[0].start_offset_s
+    k0_slow_end = k0_slow_start + warmup_slow_planned * stretch
+    k0_fast_end = k0_slow_end + params.fast_half_s
+    ramp(k0_slow_start, k0_slow_end, params.purge_x, top_x)
+    ramp(k0_slow_end, k0_fast_end, top_x, params.purge_x)
+    # K[1..]: on plan pace, shifted by the warm-up overrun.
+    actual_slow_starts = [k0_slow_start]
+    for seg in plan.segments[1:]:
+        slow_start = seg.start_offset_s + extra
+        slow_end = slow_start + params.slow_half_s
+        fast_end = slow_end + params.fast_half_s
+        ramp(slow_start, slow_end, params.purge_x, top_x)
+        ramp(slow_end, fast_end, top_x, params.purge_x)
+        actual_slow_starts.append(slow_start)
+    # Trailing rise so the peak-follower confirms the last -1 transition.
+    last_fast_end = plan.segments[-1].start_offset_s + plan.segments[-1].duration_s + extra
+    m_park = pos_rel >= last_fast_end + 0.5
+    pos_x[m_park] = params.purge_x + 2.0
+
+    result = _slice_from_pos_transitions(
+        pos_t, pos_x, plan, sweep_t0,
+        coupled_amplitude_mm=params.coupled_dx_mm,
+    )
+    assert result is not None, (
+        "transition slicer must not bail on a stretched warm-up leg"
+    )
+    windows, refined_t0 = result
+    assert len(windows) == len(plan.segments)
+    # The motion-onset detector lags the true onset by however long the
+    # ultra-slow creep takes to clear motion_threshold (tens of seconds
+    # here); refined_t0 inherits that lag. Compare in ABSOLUTE time.
+    k0_lo_abs = windows[0][0] + refined_t0
+    assert 0.0 <= k0_lo_abs - (sweep_t0 + k0_slow_start) < 30.0, (
+        f"K[0] abs start {k0_lo_abs:.2f} should sit at/just after the "
+        f"true onset {sweep_t0 + k0_slow_start:.2f}"
+    )
+    # K[1..] window starts are detected fast→slow troughs -- they must
+    # land on the ACTUAL (shifted) slow-leg starts, not the plan's.
+    for seg, slow_start, (t_lo, t_hi) in zip(
+        plan.segments[1:], actual_slow_starts[1:], windows[1:]
+    ):
+        t_lo_abs = t_lo + refined_t0
+        assert abs(t_lo_abs - (sweep_t0 + slow_start)) < 0.3, (
+            f"K={seg.k} abs t_lo={t_lo_abs:.2f} expected "
+            f"{sweep_t0 + slow_start:.2f}"
+        )
+        assert abs((t_hi - t_lo) - seg.duration_s) < 0.2, (
+            f"K={seg.k} span {t_hi - t_lo:.3f} expected {seg.duration_s:.3f}"
+        )
 
 
 def test_slice_from_plan_returns_warmup_aware_windows():

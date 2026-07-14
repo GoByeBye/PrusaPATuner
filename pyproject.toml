@@ -9,11 +9,10 @@ description = "Automatic Linear Advance tuner for the Prusa Core One using the n
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Stefan Hermann (CNC Kitchen)" }]
-license = { text = "AGPL-3.0-or-later" }
+license = "AGPL-3.0-or-later"
 license-files = ["LICENSE"]
 keywords = ["3d-printing", "prusa", "core-one", "linear-advance", "pressure-advance", "calibration"]
 classifiers = [
-    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",

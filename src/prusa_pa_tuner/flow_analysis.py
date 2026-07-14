@@ -108,6 +108,7 @@ def _rolling_mean(y: np.ndarray, win: int) -> np.ndarray:
 
 def detect_flow_sweep(
     force_t: np.ndarray, force_y: np.ndarray, n_steps: int, dwell_s: float,
+    notes: list[str] | None = None,
 ) -> tuple[float, float, float] | None:
     """Locate the extrusion sweep [start, end] from the force signal alone.
 
@@ -131,6 +132,22 @@ def detect_flow_sweep(
          start = end - N*dwell_s. The START is NOT trusted directly --
          the lowest-flow steps can fall under the activity threshold.
 
+    BASELINE-SHIFT GUARD: the head baseline silently breaks when the
+    firmware re-tares / DC-shifts the loadcell AFTER capture start.
+    On the user's flow_1784018216 the raw level stepped from 787 to ~0
+    at t≈7 s (firmware tare during heat-up); |force − head_base| then
+    exceeded the threshold for the ENTIRE remainder of the capture, the
+    active run stretched to the very last sample, and the end-anchor
+    landed 27 s (9 steps!) after the real sweep end. The end-anchor is
+    only trustworthy when the run's end is followed by QUIET (the sweep
+    always drops into an idle cooldown tail), so we validate exactly
+    that: if the winning run ends at the capture edge OR the ~5 s after
+    it still read active (a stale baseline makes idle read active; a
+    DC shift that cancels against mid-staircase levels can even split
+    the run in two, parking the "end" mid-sweep), retry with a baseline
+    from the capture TAIL -- measured after any tare shift -- and
+    prefer the retry when ITS run end passes the quiet check.
+
     Returns (start_t, end_t, step_width) or None. step_width = dwell_s:
     each constant-velocity E move runs for ~dwell_s with no inter-step gap
     (the tiny accel ramp is negligible vs a multi-second dwell).
@@ -144,61 +161,93 @@ def detect_flow_sweep(
     fs = 1.0 / dt
     expected = n_steps * dwell_s
 
-    # Idle baseline from the first 3 s (capture starts pre-extrusion);
-    # median is robust to brief homing/probing spikes.
-    head = force_t < force_t[0] + 3.0
-    if int(head.sum()) > 5:
-        base = float(np.median(force_y[head]))
-        res = force_y[head] - base
-    else:
-        base = float(np.median(force_y))
-        res = force_y - base
-    noise = 1.4826 * float(np.median(np.abs(res - np.median(res))))
-    if not np.isfinite(noise) or noise <= 0:
-        noise = float(np.std(res)) or 1.0
+    def base_noise(mask: np.ndarray) -> tuple[float, float]:
+        """Idle baseline + MAD noise over `mask` (median: spike-robust)."""
+        vals = force_y[mask] if int(mask.sum()) > 5 else force_y
+        base = float(np.median(vals))
+        res = vals - base
+        noise = 1.4826 * float(np.median(np.abs(res - np.median(res))))
+        if not np.isfinite(noise) or noise <= 0:
+            noise = float(np.std(res)) or 1.0
+        return base, noise
 
-    win = max(1, int(round(0.25 * fs)))
-    sm = _rolling_mean(np.abs(force_y - base), win)
-    amp = float(np.percentile(sm, 99))
-    thr = max(8.0 * noise, 0.05 * amp)
-    active = sm > thr
+    def best_run(base: float, noise: float) -> tuple[tuple[int, int], bool] | None:
+        """Highest-energy plausible active run for a given idle baseline.
 
-    # contiguous active runs, bridging only short (<1 s) gaps so post-sweep
-    # spikes (separated by idle) don't merge into the sweep.
-    gap_max = int(round(1.0 * fs))
-    runs: list[tuple[int, int]] = []
-    i = 0
-    while i < n:
-        if not active[i]:
-            i += 1
-            continue
-        j = i
-        while j < n:
-            if active[j]:
-                j += 1
-            else:
-                k = j
-                while k < n and not active[k]:
-                    k += 1
-                if k < n and (k - j) <= gap_max:
-                    j = k
+        Returns ((start_idx, end_idx), end_followed_by_quiet). The quiet
+        flag is the end-anchor's validity check: at least 1 s of samples
+        must exist after the run end (else the run touches the capture
+        edge) and the ~5 s after the end must be mostly inactive.
+        """
+        win = max(1, int(round(0.25 * fs)))
+        sm = _rolling_mean(np.abs(force_y - base), win)
+        amp = float(np.percentile(sm, 99))
+        thr = max(8.0 * noise, 0.05 * amp)
+        active = sm > thr
+
+        # contiguous active runs, bridging only short (<1 s) gaps so
+        # post-sweep spikes (separated by idle) don't merge into the sweep.
+        gap_max = int(round(1.0 * fs))
+        runs: list[tuple[int, int]] = []
+        i = 0
+        while i < n:
+            if not active[i]:
+                i += 1
+                continue
+            j = i
+            while j < n:
+                if active[j]:
+                    j += 1
                 else:
-                    break
-        runs.append((i, j - 1))
-        i = j
-    if not runs:
+                    k = j
+                    while k < n and not active[k]:
+                        k += 1
+                    if k < n and (k - j) <= gap_max:
+                        j = k
+                    else:
+                        break
+            runs.append((i, j - 1))
+            i = j
+        if not runs:
+            return None
+
+        def energy(r: tuple[int, int]) -> float:
+            return float(np.sum(sm[r[0]:r[1] + 1]))
+
+        # Prefer runs of plausible duration; the sweep dominates energy.
+        candidates = [
+            r for r in runs
+            if (force_t[r[1]] - force_t[r[0]]) >= 0.4 * expected
+        ] or runs
+        run = max(candidates, key=energy)
+        after_lo = run[1] + 1
+        after_hi = min(n, after_lo + int(round(5.0 * fs)))
+        quiet = (
+            after_hi - after_lo >= int(round(1.0 * fs))
+            and float(np.mean(active[after_lo:after_hi])) < 0.2
+        )
+        return run, quiet
+
+    # Idle baseline from the first 3 s (capture starts pre-extrusion).
+    head = best_run(*base_noise(force_t < force_t[0] + 3.0))
+
+    # Baseline-shift guard: end-anchor not followed by quiet -> retry
+    # with a tail baseline (see docstring).
+    best = head
+    if head is None or not head[1]:
+        tail = best_run(*base_noise(force_t > force_t[-1] - 3.0))
+        if tail is not None and (head is None or tail[1]):
+            if notes is not None:
+                notes.append(
+                    "sweep detection: capture-head baseline left the active "
+                    "run's end followed by more activity (loadcell DC shift "
+                    "after capture start?) -- re-anchored with a tail baseline"
+                )
+            best = tail
+    if best is None:
         return None
 
-    def energy(r: tuple[int, int]) -> float:
-        return float(np.sum(sm[r[0]:r[1] + 1]))
-
-    # Prefer runs of plausible duration; the sweep dominates total energy.
-    candidates = [
-        r for r in runs
-        if (force_t[r[1]] - force_t[r[0]]) >= 0.4 * expected
-    ] or runs
-    best = max(candidates, key=energy)
-    end_t = float(force_t[best[1]])
+    end_t = float(force_t[best[0][1]])
     start_t = max(end_t - expected, float(force_t[0]))
     # W is physically exact (constant-velocity E moves, no inter-step gap).
     # The end-anchor fixes WHERE the sweep is; the sub-step PHASE is refined
@@ -328,7 +377,7 @@ def analyse_flow(
     # This is the reliable anchor: it finds where extrusion actually
     # happened, independent of planned timing and the (often absent) pos_z
     # Z-marker. See detect_flow_sweep for the method.
-    detected = detect_flow_sweep(force_t, force_y, n_steps, p.dwell_s)
+    detected = detect_flow_sweep(force_t, force_y, n_steps, p.dwell_s, notes)
     if detected is not None:
         sweep_start, sweep_end, step_width = detected
         # Refine the sub-step phase so step rises land in the discarded
@@ -356,16 +405,23 @@ def analyse_flow(
             "(check that the loadcell streamed during extrusion)"
         )
 
-    # --- Z-marker cross-check when pos_z is present ---
+    # --- Z-marker cross-check / override when pos_z is present ---
     # pos_z anchors the marker; planned offset to step0 = segments[0]
-    # start_offset (pre-roll + tare hold). We don't override the
-    # force-based detection with it -- just log agreement so a future
-    # discrepancy is visible. If detection failed, fall back to it.
+    # start_offset (pre-roll + tare hold -- G4 dwells the firmware times
+    # exactly, unlike the heat-up before the marker). When force detection
+    # and the marker agree within half a step, keep the force anchor (it
+    # is phase-refined on the data). A larger disagreement means the
+    # activity detector mis-anchored -- the marker is a detected physical
+    # event, so it wins, and the phase aligner re-refines around it. On
+    # the user's flow_1784018216 the marker predicted step 0 dead-on
+    # while a stale head baseline had dragged the force anchor 27 s late;
+    # the old log-only cross-check watched it happen without acting.
     if pos_z is not None and pos_z_t is not None and len(pos_z) > 10:
         anchor = _detect_z_marker_anchor(
             np.asarray(pos_z_t, dtype=float),
             np.asarray(pos_z, dtype=float),
             expected_lift_mm=z_marker_lift_mm,
+            expected_base_z_mm=p.purge_z,
         )
         if anchor is not None and plan.segments:
             marker_start = float(anchor) + plan.segments[0].start_offset_s
@@ -377,6 +433,18 @@ def analyse_flow(
                 sweep_start = marker_start
                 sweep_end = sweep_start + n_steps * step_width
                 detect_method = "Z-marker (planned offset)"
+            elif abs(sweep_start - marker_start) > 0.5 * step_width:
+                sweep_start = _align_grid_phase(
+                    force_t, force_y, marker_start, n_steps, step_width,
+                    p.settle_frac, sample_rate_hz or 100.0,
+                )
+                sweep_end = sweep_start + n_steps * step_width
+                detect_method = "Z-marker override (force-activity anchor rejected)"
+                notes.append(
+                    "force-activity anchor disagrees with the Z marker by "
+                    "more than half a step -- overriding with the marker "
+                    f"(step 0 now at {sweep_start:.2f}s after phase refinement)"
+                )
 
     # --- tare from the no-flow window just before the first step ---
     # The 1 s before step 0 is the tare hold + pre-roll (extruder idle), so

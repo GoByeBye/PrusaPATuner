@@ -210,6 +210,97 @@ def test_detect_sweep_in_realistic_capture():
     assert abs(lv0.force_mean - (3.0 * 4 ** 0.55 + 4.0)) < 2.0
 
 
+def test_detect_sweep_survives_baseline_dc_shift():
+    """Regression for runs/flow_1784018216: the firmware re-tares the
+    loadcell a few seconds into the capture, DC-shifting the idle level by
+    ~800 raw units. A baseline taken from the capture head then makes the
+    entire remainder read "active", the run stretches to the last sample,
+    and the end-anchor lands many steps late. The tail-baseline retry must
+    recover the true sweep edges."""
+    rng = np.random.default_rng(3)
+    p = FlowRampParams(min_flow_mm3_s=4, max_flow_mm3_s=30, flow_step_mm3_s=2,
+                       dwell_s=3.0, settle_frac=0.5)
+    plan = build_flow_ramp(p)
+    fs = 180.0
+    offset = 200.0
+    tare_shift = 800.0
+    heat_s = 40.0
+    tail_s = 15.0
+    true_start = heat_s
+    true_end = heat_s + len(plan.segments) * p.dwell_s
+
+    t = np.arange(0.0, true_end + tail_s, 1.0 / fs)
+    y = np.full_like(t, offset) + rng.normal(0, 2, len(t))
+    # pre-tare head: idle sits tare_shift ABOVE the post-tare level
+    y[t < 8.0] += tare_shift
+    for i, seg in enumerate(plan.segments):
+        q = seg.flow_mm3_s
+        m = (t >= heat_s + i * p.dwell_s) & (t < heat_s + (i + 1) * p.dwell_s)
+        y[m] += 60.0 * q ** 0.9  # staircase well above idle noise
+    det = detect_flow_sweep(t, y, len(plan.segments), p.dwell_s)
+    assert det is not None
+    start, end, width = det
+    assert abs(end - true_end) < p.dwell_s
+    assert abs(start - true_start) < p.dwell_s
+
+    # end-to-end: tare must come from the true pre-step idle (post-tare
+    # level), not from somewhere inside the sweep
+    a = analyse_flow(sweep_t0=0.0, force_t=t, force_y=y, plan=plan)
+    assert abs(a.tare - offset) < 10.0
+    lv0 = min(a.levels, key=lambda lv: lv.flow_mm3_s)
+    assert abs(lv0.force_mean - 60.0 * 4 ** 0.9) < 15.0
+
+
+def test_z_marker_overrides_bad_force_anchor():
+    """When a post-sweep disturbance out-energies the sweep and drags the
+    force-activity anchor off by more than half a step, a detected Z marker
+    must override it (it was previously log-only and watched misalignment
+    happen)."""
+    rng = np.random.default_rng(4)
+    p = FlowRampParams(min_flow_mm3_s=4, max_flow_mm3_s=30, flow_step_mm3_s=2,
+                       dwell_s=3.0, settle_frac=0.5)
+    plan = build_flow_ramp(p)
+    fs = 180.0
+    offset = 500.0
+    heat_s = 30.0
+    true_start = heat_s
+    true_end = heat_s + len(plan.segments) * p.dwell_s
+    expected = len(plan.segments) * p.dwell_s
+
+    # decoy: a long, huge-amplitude disturbance well after the sweep
+    decoy_lo = true_end + 5.0
+    decoy_hi = decoy_lo + 0.5 * expected
+    t = np.arange(0.0, decoy_hi + 10.0, 1.0 / fs)
+    y = np.full_like(t, offset) + rng.normal(0, 2, len(t))
+    for i, seg in enumerate(plan.segments):
+        q = seg.flow_mm3_s
+        m = (t >= heat_s + i * p.dwell_s) & (t < heat_s + (i + 1) * p.dwell_s)
+        y[m] += 60.0 * q ** 0.9
+    dm = (t >= decoy_lo) & (t < decoy_hi)
+    y[dm] += 8000.0 * np.sign(np.sin(2 * np.pi * 2.0 * (t[dm] - decoy_lo)))
+
+    # sanity: without the marker, the decoy wins and the anchor is wrong
+    det = detect_flow_sweep(t, y, len(plan.segments), p.dwell_s)
+    assert det is not None
+    assert abs(det[0] - true_start) > 0.5 * p.dwell_s
+
+    # Z marker: settled baseline, +2 mm pulse returning right before the
+    # planned pre-roll + tare hold that leads into step 0
+    marker_return = true_start - plan.segments[0].start_offset_s
+    zt = np.arange(0.0, t[-1], 0.02)
+    # The marker is emitted AT the purge height -- the detector's baseline
+    # gate rejects pulses that happen anywhere else (homing probe taps).
+    z = np.full_like(zt, p.purge_z)
+    z[(zt >= marker_return - 0.5) & (zt < marker_return)] = p.purge_z + 2.0
+
+    a = analyse_flow(sweep_t0=0.0, force_t=t, force_y=y, plan=plan,
+                     pos_z_t=zt, pos_z=z)
+    assert a.detect_method.startswith("Z-marker override")
+    assert abs(a.sweep_t0 - true_start) < 0.5 * p.dwell_s
+    lv0 = min(a.levels, key=lambda lv: lv.flow_mm3_s)
+    assert abs(lv0.force_mean - 60.0 * 4 ** 0.9) < 15.0
+
+
 def test_phase_alignment_recovers_rise_boundaries():
     """Given a staircase with rise ramps at known boundaries and a grid that
     is deliberately shifted LATE, the phase aligner must pull it back so the

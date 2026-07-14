@@ -73,32 +73,32 @@
     <section class="card pa-view">
       <h2>3. Sweep parameters</h2>
       <div class="row">
-        <label>Slow flow (mm³/s) <input id="slow_flow_mm3_s" type="number" step="0.01" value="1.92" /></label>
-        <label>Slow volume (mm³) <input id="slow_volume_mm3" type="number" step="0.01" value="1.92" /></label>
-        <label>Fast flow (mm³/s) <input id="fast_flow_mm3_s" type="number" step="0.01" value="19.24" /></label>
-        <label>Fast volume (mm³) <input id="fast_volume_mm3" type="number" step="0.01" value="4.81" /></label>
-        <label>Cycles / K <input id="cycles_per_K" type="number" step="1" value="14" /></label>
-        <label>Accel (mm/s²) <input id="accel_mm_s2" type="number" step="50" value="5000" /></label>
+        <label>Slow flow (mm³/s) <input id="slow_flow_mm3_s" type="number" step="0.01" value="3" /></label>
+        <label>Slow volume (mm³) <input id="slow_volume_mm3" type="number" step="0.01" value="6" /></label>
+        <label>Fast flow (mm³/s) <input id="fast_flow_mm3_s" type="number" step="0.01" value="14" /></label>
+        <label>Fast volume (mm³) <input id="fast_volume_mm3" type="number" step="0.01" value="10" /></label>
+        <label>Cycles / K <input id="cycles_per_K" type="number" step="1" value="4" /></label>
+        <label>Accel (mm/s²) <input id="accel_mm_s2" type="number" step="50" value="500" /></label>
       </div>
       <div class="row">
         <label>K min <input id="k_min" type="number" step="0.001" value="0.000" /></label>
-        <label>K max <input id="k_max" type="number" step="0.001" value="0.100" /></label>
-        <label>K step <input id="k_step" type="number" step="0.001" value="0.002" /></label>
+        <label>K max <input id="k_max" type="number" step="0.001" value="0.050" /></label>
+        <label>K step <input id="k_step" type="number" step="0.001" value="0.005" /></label>
       </div>
       <div class="row">
         <label>Purge X <input id="purge_x" type="number" step="1" value="30" /></label>
         <label>Purge Y <input id="purge_y" type="number" step="1" value="30" /></label>
-        <label>Purge Z <input id="purge_z" type="number" step="1" value="50" /></label>
+        <label>Purge Z <input id="purge_z" type="number" step="1" value="80" /></label>
       </div>
       <div class="row">
-        <label>Coupled ΔX (mm) <input id="coupled_dx_mm" type="number" step="0.01" value="0.05" /></label>
+        <label>Coupled ΔX (mm) <input id="coupled_dx_mm" type="number" step="0.01" value="1.00" /></label>
         <label>Coupled ΔY (mm) <input id="coupled_dy_mm" type="number" step="0.01" value="0.00" /></label>
         <label>Coupled ΔZ (mm) <input id="coupled_dz_mm" type="number" step="0.01" value="0.00" /></label>
       </div>
       <div class="row">
         <label title="K[0] cycle 0's first slow extrusion is multiplied by this factor so it both purges old filament and establishes steady-state melt pressure before the first slow→fast transition. Replaces the legacy 2 mm prime + 500 ms dwell. Set to 1 to disable.">
           First slow-leg factor (warm-up)
-          <input id="first_slow_leg_factor" type="number" step="0.5" min="1" value="10" />
+          <input id="first_slow_leg_factor" type="number" step="0.5" min="1" value="5" />
         </label>
       </div>
     </section>

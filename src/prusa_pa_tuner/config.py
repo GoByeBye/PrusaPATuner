@@ -44,57 +44,50 @@ class AppConfig:
     # cross-section area:
     #     feed_mm_s = flow_mm3_s / (pi/4 * filament_diameter^2)
     #     half_s    = volume_mm3 / flow_mm3_s
-    # Defaults reproduce the previous Snapmaker-U1-style 0.8 mm/s × 1.0 s
-    # slow + 8.0 mm/s × 0.25 s fast for 1.75 mm filament:
-    #   area_1.75 ≈ 2.405 mm²
-    #   slow flow = 0.8 * 2.405 ≈ 1.92 mm³/s; slow volume ≈ 1.92 mm³
-    #   fast flow = 8.0 * 2.405 ≈ 19.24 mm³/s; fast volume ≈ 4.81 mm³
-    slow_flow_mm3_s: float = 1.92
-    fast_flow_mm3_s: float = 19.24
-    slow_volume_mm3: float = 1.92
-    fast_volume_mm3: float = 4.81
-    cycles_per_K: int = 14
-    # Raised from 200 → 5000 mm/s² after the bd_pressure comparison: at 200
-    # the velocity transition takes ~36 ms and the resulting pressure
-    # transient is barely K-dependent (both metrics came back flat with
-    # R²≈0). At 5000 the transition is ~1.4 ms, dp/dt grows ~25×, and PA's
-    # effect on the transient grows with it. Buddy may silently clamp below
-    # 5000 -- the gcode-echo stream in the runner surfaces the actual value
-    # that was applied.
-    accel_mm_s2: float = 5000.0
-    # Fine sweep matching bd_pressure's granularity (0..0.10 in 0.002
-    # steps, inclusive of k_max). The previous coarse 9-step 0..0.40 sweep
-    # relied on a clean linear trend through phase-lag-vs-K; at low SNR
-    # the slope estimate was dominated by noise and `k_opt = -intercept/slope`
-    # swung wildly. The new fine grid feeds the bd_pressure-style argmin
-    # extraction over `amplitude + |asymmetry|`, which doesn't need
-    # extrapolation -- it picks the K where the pressure transient is
-    # smallest. K values are derived in the runner as
+    # For 1.75 mm filament (area ≈ 2.405 mm²) the defaults work out to
+    # ~1.25 mm/s × 2.0 s slow + ~5.8 mm/s × 0.71 s fast.
+    slow_flow_mm3_s: float = 3.0
+    fast_flow_mm3_s: float = 14.0
+    slow_volume_mm3: float = 6.0
+    fast_volume_mm3: float = 10.0
+    cycles_per_K: int = 4
+    # E-axis accel emitted via M204. Higher values sharpen the velocity
+    # transition and boost dp/dt (see gcode_gen.SweepParams.accel_mm_s2 for
+    # the 200-vs-5000 comparison); Buddy may silently clamp -- the
+    # gcode-echo stream in the runner surfaces the actual applied value.
+    accel_mm_s2: float = 500.0
+    # Fine sweep (0..0.05 in 0.005 steps, inclusive of k_max). The previous
+    # coarse 9-step 0..0.40 sweep relied on a clean linear trend through
+    # phase-lag-vs-K; at low SNR the slope estimate was dominated by noise
+    # and `k_opt = -intercept/slope` swung wildly. The fine grid feeds the
+    # bd_pressure-style argmin extraction over `amplitude + |asymmetry|`,
+    # which doesn't need extrapolation -- it picks the K where the pressure
+    # transient is smallest. K values are derived in the runner as
     # `k_min + i*k_step for i in 0..n` where n = round((k_max-k_min)/k_step).
     k_min: float = 0.0
-    k_max: float = 0.10
-    k_step: float = 0.002
+    k_max: float = 0.05
+    k_step: float = 0.005
     purge_x: float = 30.0
     purge_y: float = 30.0
-    purge_z: float = 50.0
+    purge_z: float = 80.0
     # Per-axis coupling amplitudes. At least one of dx/dy must be > 0 for
     # Buddy/Marlin to apply M572 PA (Z+E does not trigger PA because Z is
     # on its own stepper, decoupled from the A/B/CoreXY pair). dz is
     # exposed so the user can experiment with what couples least into the
     # loadcell signal.
-    # 0.4 mm default (was 0.05): pos_x is quantized to ~0.05-0.1 mm, so
+    # 1.0 mm default (was 0.05): pos_x is quantized to ~0.05-0.1 mm, so
     # the old amplitude sat at the sensor floor and cycle-transition
     # detection had no margin. See SweepParams.coupled_dx_mm.
-    coupled_dx_mm: float = 0.4
+    coupled_dx_mm: float = 1.0
     coupled_dy_mm: float = 0.0
     coupled_dz_mm: float = 0.0
     # First slow-leg warm-up factor. K[0]'s very first slow extrusion
     # is `slow_half_s × first_slow_leg_factor` long -- so with the
-    # default factor=10 and slow_half=2 s, the sweep opens with 20 s
+    # default factor=5 and slow_half=2 s, the sweep opens with 10 s
     # of slow flow which both purges old filament and establishes
     # steady-state melt pressure before the first slow→fast
     # transition. Replaces the legacy 2 mm prime + 500 ms dwell.
-    first_slow_leg_factor: float = 10.0
+    first_slow_leg_factor: float = 5.0
     filament_label: str = "PLA"
 
     # --- Max Flow test parameters ---

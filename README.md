@@ -102,7 +102,10 @@ calibration, it has what this tool needs.
   A LAN cable solves it outright.
 - The printer must be able to reach the host over **UDP/8514** — same LAN is the
   simple case, routed subnets work too — and the host firewall must permit
-  **inbound UDP/8514**.
+  **inbound UDP/8514**. **On Windows this almost always needs a one-time firewall
+  fix run from an *admin* PowerShell** — see
+  [Windows firewall — fix it in an admin PowerShell](#windows-firewall--fix-it-in-an-admin-powershell)
+  before your first run.
 - **Python 3.11+** on the host.
 
 ## Install
@@ -118,6 +121,12 @@ source .venv/bin/activate
 
 pip install -e .
 ```
+
+> **Windows:** see [`docs/SETUP-WINDOWS.md`](docs/SETUP-WINDOWS.md) for a
+> battle-tested walkthrough — including two `pip install -e .` build errors on
+> modern setuptools (fixed in the repo, documented there), why you must stop the
+> app before re-running `pip install` in the venv, and a firewall diagnosis that
+> catches silent packet drops the app itself can't see.
 
 ## Step 0 — activate the metrics on the printer
 
@@ -157,28 +166,35 @@ the firmware but silent on current stock builds — don't worry if they stay at 
 If everything is silent, check (in order):
 
 - the printer's Metrics & Log host IP matches your host's LAN address,
-- inbound UDP/8514 is allowed by the host firewall (see the Windows trap below),
+- inbound UDP/8514 is allowed by the host firewall (on Windows see the firewall
+  section below — the fix needs an **admin** PowerShell),
 - metrics are still enabled on the touchscreen (see above).
 
-### Windows trap: metrics stop working after a Python update
+### Windows firewall — fix it in an admin PowerShell
 
-If metrics used to arrive and then **silently stopped** — printer config untouched,
-app looks healthy, Diagnostics shows `packets: 0` — the most likely culprit is the
-Windows firewall, in a way that's easy to miss:
+> **If the app looks healthy but Diagnostics shows `packets: 0`, this is almost
+> certainly the Windows firewall — and the fix MUST be run from an *elevated
+> (admin)* PowerShell.** A regular shell can diagnose the problem, but gets
+> *Access denied* when it tries to change the rules. Right-click Start →
+> "Terminal (Admin)".
 
-- Windows firewall Allow rules are bound to the **exact .exe path** of the program.
-  The Microsoft Store Python auto-updates into a *new versioned folder*
-  (`...\PythonSoftwareFoundation.Python.3.13_3.13.XXXX.0_x64_...\python3.13.exe`),
-  so after every Python update your old "allow Python" rule no longer matches.
-- The first time the tool runs on the updated Python, Windows shows a new firewall
-  prompt. If it gets dismissed (Esc, or the popup times out unnoticed), Windows
-  creates an **enabled inbound *Block* rule** for the new python3.13.exe.
+The mechanism, and why nothing *looks* wrong:
+
+- Whenever a Windows firewall prompt for Python gets dismissed (Esc, or the
+  popup times out unnoticed), Windows creates an **enabled inbound *Block*
+  rule** bound to that exact python.exe path. It stays there forever.
 - **Block beats Allow.** Even a correct port-based rule like "allow UDP 8514" is
   overridden by that program-level Block rule. Every printer packet then reaches
   your PC and dies at the firewall — while loopback tests still pass, so the app
   itself looks fine.
+- A venv's python.exe is only a launcher: the **base** interpreter is the
+  process that binds the socket, so the base python.exe's firewall rules are the
+  ones that count.
+- The auto-created Block rules are often scoped to the **Public** profile — and
+  Windows classifies most WiFi networks as Public by default, so they very
+  likely apply to your LAN.
 
-Diagnose it (regular PowerShell):
+**Step 1 — diagnose** (regular PowerShell is fine):
 
 ```powershell
 Get-NetFirewallApplicationFilter | Where-Object { $_.Program -like '*python*' } |
@@ -188,20 +204,36 @@ Get-NetFirewallApplicationFilter | Where-Object { $_.Program -like '*python*' } 
 ```
 
 Any line with `enabled=True action=Block` pointing at your current Python is the
-problem. Fix it (elevated PowerShell):
+problem.
+
+**Step 2 — fix, in an *admin* PowerShell** (a regular one will fail):
 
 ```powershell
-Get-NetFirewallRule -DisplayName 'Python' |
-  Where-Object { $_.Action -eq 'Block' -and $_.Enabled -eq 'True' } |
+Get-NetFirewallApplicationFilter |
+  Where-Object { $_.Program -like '*python*' } |
+  Get-NetFirewallRule | Where-Object { $_.Action -eq 'Block' } |
   Set-NetFirewallRule -Action Allow
 ```
 
-(or Windows Security → Firewall & network protection → *Allow an app through
-firewall* → tick the "Python" entries). Packets should start flowing within
-seconds — watch the `packets` counter in the app's Diagnostics panel. Expect a
-repeat of this after the next Store Python auto-update; a version-independent
-inbound rule for `UDP 8514` does **not** protect you, because the per-program
-Block rule still wins.
+Match on the program path as shown — don't filter on `-DisplayName 'Python'`,
+because the auto-created rules are typically named `python.exe`, not `Python`.
+GUI alternative: Windows Security → Firewall & network protection → *Allow an
+app through firewall* → tick **all** checkboxes (including *Public*) for the
+Python entries.
+
+Packets should start flowing within seconds — watch the `packets` counter in the
+app's Diagnostics panel.
+
+#### Store Python: the fix un-does itself after every Python update
+
+If you run the Microsoft Store Python, expect to repeat the fix after every
+auto-update: Store Python updates into a *new versioned folder*
+(`...\PythonSoftwareFoundation.Python.3.13_3.13.XXXX.0_x64_...\python3.13.exe`),
+so your old Allow rule no longer matches the new path, Windows shows a fresh
+prompt, and a dismissed prompt creates a fresh Block rule. A version-independent
+inbound rule for `UDP 8514` does **not** protect you — the per-program Block
+rule still wins. The python.org installer keeps a stable path and avoids the
+churn entirely.
 
 Full protocol reference: [`Prusa-Firmware-Buddy/doc/metrics.md`](https://github.com/prusa3d/Prusa-Firmware-Buddy/blob/master/doc/metrics.md).
 
