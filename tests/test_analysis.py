@@ -3017,6 +3017,78 @@ def test_signed_area_fit_falls_back_to_global_without_crossing():
     assert abs(fit.k_opt - 0.10) < 0.005
 
 
+def test_quadratic_zero_crossing_beats_ols_on_saturating_lag_curve():
+    """The lag-vs-K response saturates at high K (steep drop near K=0,
+    flat tail). A global OLS line is rotated by the tail and its zero
+    crossing lands high; the quadratic's descending root must land on
+    the true crossing (observed on real runs, e.g. run_1783431794:
+    OLS 0.0421 vs quad 0.0305 vs user-annotated 0.030)."""
+    from prusa_pa_tuner.analysis import (
+        _linear_fit_zero_crossing,
+        _quadratic_zero_crossing,
+    )
+
+    ks = np.arange(0.0, 0.101, 0.01)
+    true_k = 0.030
+    # Saturating exponential through zero at true_k, like the real data.
+    y = 30.0 * (np.exp(-ks / 0.035) - np.exp(-true_k / 0.035))
+
+    quad = _quadratic_zero_crossing(ks, y, "phase_lag")
+    ols = _linear_fit_zero_crossing(ks, y, "phase_lag")
+    assert quad is not None and ols is not None
+    assert quad.method == "phase_lag_quad"
+    assert quad.quad != 0.0
+    assert abs(quad.k_opt - true_k) < 0.005, f"k_opt={quad.k_opt:.4f}"
+    # The line must be visibly worse (dragged high) or the quadratic
+    # buys nothing.
+    assert abs(quad.k_opt - true_k) < abs(ols.k_opt - true_k)
+
+
+def test_quadratic_zero_crossing_falls_back_without_crossing():
+    """All-positive lags (sweep ended below K_opt) leave no descending
+    in-range root — the estimator must fall back to the global linear
+    fit (extrapolation), flagged by the missing '_quad' suffix."""
+    from prusa_pa_tuner.analysis import _quadratic_zero_crossing
+
+    ks = np.arange(0.0, 0.05, 0.005)
+    y = 20.0 - 150.0 * ks  # crosses at 0.133, far outside the sweep
+    fit = _quadratic_zero_crossing(ks, y, "phase_lag")
+    assert fit is not None
+    assert fit.method == "phase_lag"
+    assert fit.quad == 0.0
+    assert abs(fit.k_opt - 0.1333) < 0.005
+
+
+def test_quadratic_zero_crossing_handles_linear_data():
+    """Perfectly linear lag data must not break the quadratic path
+    (a ≈ 0 → near-degenerate parabola): the descending root still
+    lands on the straight line's crossing."""
+    from prusa_pa_tuner.analysis import _quadratic_zero_crossing
+
+    ks = np.arange(0.0, 0.101, 0.01)
+    y = -400.0 * (ks - 0.045)
+    fit = _quadratic_zero_crossing(ks, y, "phase_lag")
+    assert fit is not None
+    assert abs(fit.k_opt - 0.045) < 0.002, f"k_opt={fit.k_opt:.4f}"
+
+
+def test_quadratic_zero_crossing_rejects_upward_parabola():
+    """Pure-noise lag data often fits an upward-opening parabola whose
+    roots are ascending crossings or out of range — no descending
+    in-range root means fall back to linear, never return a root from
+    the unphysical rising branch."""
+    from prusa_pa_tuner.analysis import _quadratic_zero_crossing
+
+    ks = np.arange(0.0, 0.101, 0.005)
+    # Upward parabola with vertex mid-sweep, entirely above zero except
+    # a dip — its only crossings are on the rising branch or absent.
+    y = 5.0 + 3000.0 * (ks - 0.05) ** 2
+    fit = _quadratic_zero_crossing(ks, y, "phase_lag")
+    # y never crosses zero at all -> linear fallback (whatever the line
+    # extrapolates to), but never a "_quad" answer from the rising branch.
+    assert fit is None or not fit.method.endswith("_quad")
+
+
 def test_overshoot_stays_unclamped_negative_when_peak_below_expectation():
     """Regression against re-introducing the censoring clamp: a segment
     whose peak sits BELOW plateau + expected-noise-max must report a

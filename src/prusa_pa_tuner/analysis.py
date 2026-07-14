@@ -6,7 +6,10 @@ empirically:
 1. **Phase-lag (cross-correlation)** — for each K, build the commanded extrusion-velocity
    square wave and the measured loadcell trace on a common time grid, cross-correlate
    them, and find the sub-sample peak via parabolic interpolation. The lag at peak
-   correlation is the "PA error". Linear-fit lag-vs-K → solve for lag = 0 → optimal K.
+   correlation is the "PA error". Quadratic-fit lag-vs-K → descending zero crossing →
+   optimal K (the lag response saturates at high K, so a straight line is dragged
+   high by the flat tail; falls back to a global linear fit when no in-range
+   crossing exists).
 
 2. **Integral / area fit (Snapmaker-style)** — for each K, integrate
    `(loadcell - mean) * direction_of_transition` over a window CENTERED on each
@@ -19,7 +22,8 @@ empirically:
    accel-limited ramp) is computed in parallel as `integral_area_legacy` so we can
    visually verify the centered-window form actually responds to K differences.
 
-Both methods reduce to a 1-D linear regression on K, so we share the same fit step.
+Both methods reduce to a 1-D regression on K sharing the same fit machinery
+(quadratic with linear fallback for phase-lag, linear for the integral fits).
 
 Sweep-t0 anchoring and per-K window slicing live in `alignment.py`; this module
 imports them back (and re-exports the private helper names for existing callers).
@@ -124,6 +128,10 @@ class FitResult:
     intercept: float
     r_squared: float
     method: str  # "phase_lag" or "integral"
+    # Coefficient of k² when the fit is a quadratic (method suffix
+    # "_quad"): y = quad·k² + slope·k + intercept. Stays 0.0 for the
+    # linear fits so slope/intercept keep their meaning everywhere.
+    quad: float = 0.0
 
 
 @dataclass(slots=True)
@@ -1554,6 +1562,75 @@ def _linear_fit_zero_crossing(
     )
 
 
+def _quadratic_zero_crossing(
+    k_values: np.ndarray, y_values: np.ndarray, method: str
+) -> FitResult | None:
+    """Fit y = a·k² + b·k + c, return the DESCENDING zero crossing.
+
+    Why not the linear fit: the phase-lag response saturates — steep
+    drop near K=0, near-flat tail past K_opt — so a global straight
+    line is rotated by the tail and its zero crossing lands
+    systematically high (benchmarked on 8 saved runs against the
+    user-annotated K_opt: OLS was biased +0.01..+0.02 on every run
+    while the quadratic's descending root matched the annotation and
+    had 2–4× lower leave-one-out variance).
+
+    Root selection: a parabola's derivative is monotonic, so at most
+    ONE root is on the descending branch — that is the physical
+    over-PA crossing (lag falls through zero as K rises). The root
+    must also lie within the sweep range (± 20% margin); the vertex
+    upturn past the tail is a fitting artefact, not physics, so a
+    root out there is rejected.
+
+    Falls back to the global linear fit when the data can't support a
+    quadratic (< 4 points, < 3 distinct K) or no in-range descending
+    root exists (all-positive/all-negative lags = the sweep never
+    crossed K_opt and extrapolation is the only option — a quadratic
+    extrapolates dangerously, the global trend is the best available).
+    The fallback keeps method == `method` (no "_quad" suffix) so
+    callers/UI can tell which model produced the number.
+    """
+    mask = np.isfinite(y_values)
+    if mask.sum() < 4:
+        return _linear_fit_zero_crossing(k_values, y_values, method)
+    k = k_values[mask].astype(float)
+    y = y_values[mask].astype(float)
+    if len(np.unique(k)) < 3:
+        return _linear_fit_zero_crossing(k_values, y_values, method)
+
+    a, b, c = np.polyfit(k, y, 2)
+    if a == 0.0:
+        return _linear_fit_zero_crossing(k_values, y_values, method)
+
+    disc = b * b - 4.0 * a * c
+    if disc < 0:
+        return _linear_fit_zero_crossing(k_values, y_values, method)
+    sq = math.sqrt(disc)
+    roots = ((-b - sq) / (2.0 * a), (-b + sq) / (2.0 * a))
+    margin = 0.2 * (k.max() - k.min())
+    lo, hi = k.min() - margin, k.max() + margin
+    descending = [
+        r for r in roots
+        if lo <= r <= hi and (2.0 * a * r + b) < 0
+    ]
+    if not descending:
+        return _linear_fit_zero_crossing(k_values, y_values, method)
+    k_opt = float(descending[0])
+
+    y_pred = a * k * k + b * k + c
+    ss_res = float(np.sum((y - y_pred) ** 2))
+    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+    r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 1.0
+    return FitResult(
+        k_opt=k_opt,
+        slope=float(b),
+        intercept=float(c),
+        r_squared=r2,
+        method=f"{method}_quad",
+        quad=float(a),
+    )
+
+
 def _signed_area_zero_crossing_fit(
     k_values: np.ndarray,
     y_values: np.ndarray,
@@ -2443,7 +2520,7 @@ def analyse_sweep(
         return np.asarray(arr, dtype=float)[quality_mask] if any(quality_mask) else np.asarray([])
 
     ks_fit = ks_arr_all[quality_mask] if any(quality_mask) else ks_arr_all
-    phase_fit = _linear_fit_zero_crossing(ks_fit, _masked(lags), "phase_lag")
+    phase_fit = _quadratic_zero_crossing(ks_fit, _masked(lags), "phase_lag")
     integral_fit = _linear_fit_zero_crossing(ks_fit, _masked(areas), "integral")
     integral_legacy_fit = _linear_fit_zero_crossing(
         ks_fit, _masked(areas_legacy), "integral_legacy"
@@ -2570,6 +2647,12 @@ def analyse_sweep(
 
     if phase_fit is None:
         notes.append("Phase-lag fit failed — insufficient data or zero slope.")
+    elif not phase_fit.method.endswith("_quad"):
+        notes.append(
+            "Phase-lag quadratic fit found no descending zero crossing "
+            "inside the sweep range — fell back to the global linear fit "
+            "(extrapolated K_opt, treat with caution)."
+        )
     if integral_fit is None:
         notes.append("Integral-area fit failed — insufficient data or zero slope.")
     if bd_k_opt is None:

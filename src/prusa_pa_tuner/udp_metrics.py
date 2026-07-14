@@ -394,14 +394,11 @@ class MetricStream:
         # because two consecutive packets can overlap in firmware time:
         # each anchors its newest sample at its own `recv`, but the
         # earlier samples spread back ~50 ms while the inter-packet gap
-        # is ~30 ms -- so the second packet's earliest samples land
-        # BEFORE the first packet's latest, producing out-of-order
-        # timestamps in the per-metric stream. Observed on user's
-        # run_1779015193.npz K=0.05 seg 1: a ~60 ms backward jump
-        # right after the rising edge made plotly draw a "jumpback"
-        # diagonal in the force trace. We enforce monotonicity here
-        # by clipping each new sample's recv_monotonic to be strictly
-        # greater than the previous dispatched sample for this metric.
+        # is ~30 ms. Overlaps are now resolved packet-wide (one shared
+        # affine compression into (floor, recv], see _on_packet), so
+        # this doubles as (a) the compression floor and (b) the final
+        # per-metric monotonicity safety net in _dispatch_monotonic
+        # (the run_1779015193.npz plotly "jumpback" regression).
         self._last_metric_sample_t: dict[str, float] = {}
         # Firmware timebase reconstruction. When lines arrive syslog-
         # wrapped (Metrics Port == Syslog Port), each packet carries
@@ -502,18 +499,16 @@ class MetricStream:
             ):
                 fw_emit_t = None
 
-        for name, batch in by_name.items():
-            last = self._last_metric_recv.get(name)
-            self._last_metric_recv[name] = recv
-            n = len(batch)
-            # PREFERRED: firmware-clock timestamps. Anchor at the mapped
-            # emit instant and apply each line's µs offset. Unlike the
-            # recv-anchored paths below this is jitter-free AND
-            # consistent across metrics: a loadcell sample and a pos_x
-            # sample with the same firmware time get the same host
-            # timestamp, which is what the analyser's cross-stream
-            # alignment ultimately relies on.
-            if fw_emit_t is not None:
+        # PREFERRED: firmware-clock timestamps. Anchor at the mapped
+        # emit instant and apply each line's µs offset. Unlike the
+        # recv-anchored paths below this is jitter-free AND
+        # consistent across metrics: a loadcell sample and a pos_x
+        # sample with the same firmware time get the same host
+        # timestamp, which is what the analyser's cross-stream
+        # alignment ultimately relies on.
+        if fw_emit_t is not None:
+            for name, batch in by_name.items():
+                self._last_metric_recv[name] = recv
                 for s in batch:
                     off_us = s.printer_ts_ns  # µs offset despite the name
                     t = (
@@ -522,63 +517,78 @@ class MetricStream:
                         else fw_emit_t
                     )
                     self._dispatch_monotonic(name, s, t)
-                continue
+            return
+
+        prev_recv = {name: self._last_metric_recv.get(name) for name in by_name}
+        for name in by_name:
+            self._last_metric_recv[name] = recv
+
+        # SECOND CHOICE: per-sample firmware offsets, applied PACKET-WIDE.
+        # Buddy puts a relative offset (signed int, microseconds back from
+        # "now-on-printer") at the end of each InfluxDB line:
+        # `loadcell_value v=12.3 -3693` means "this sample is 3.693 ms
+        # before the packet's emit instant". One shared anchor (the packet's
+        # newest offset) and ONE shared time transform for every metric in
+        # the packet keep the streams mutually consistent: pos_x and pos_y
+        # samples taken at the same firmware instant get the same host
+        # timestamp. (An earlier version decided per metric -- with
+        # per-metric anchors, overlap gates and 1 µs monotonic clipping --
+        # so pos_x and pos_y could take DIFFERENT paths for the same packet
+        # and end up skewed by up to a batch period. On 45° infill that
+        # skew displaces the interpolated toolhead point sideways by up to
+        # ~1 mm, which the Live Map rendered as force jumping onto the
+        # adjacent infill line.)
+        all_samples = [s for batch in by_name.values() for s in batch]
+        offsets_us = [s.printer_ts_ns for s in all_samples]
+        if all_samples and all(o is not None for o in offsets_us):
+            arr = np.asarray(offsets_us, dtype=float) / 1e6  # µs → s
+            deltas = arr - float(arr.max())  # all <= 0, seconds back from anchor
+            lasts = [v for v in prev_recv.values() if v is not None]
+            last = max(lasts) if lasts else None
+            # Sanity gate: total span < 2× inter-packet gap, OR < 500 ms --
+            # otherwise the timestamp unit is probably wrong and the spread
+            # would corrupt the timeline.
+            span = -float(deltas.min())
+            span_ok = span < (max(2.0 * (recv - last), 0.5) if last is not None else 0.5)
+            if span_ok:
+                targets = recv + deltas
+                # Two consecutive packets can overlap in firmware time (each
+                # spreads ~60 ms back while packets arrive ~30 ms apart).
+                # Instead of falling back to a per-metric uniform spread
+                # (which broke cross-metric pairing, see above), compress
+                # the WHOLE packet's samples into (floor, recv] with a
+                # single affine map: per-metric order is preserved, the
+                # stream stays strictly monotonic (no plotly back-jumps,
+                # the run_1779015193.npz regression), and simultaneous
+                # samples of different metrics still share one timestamp.
+                floors = [
+                    self._last_metric_sample_t[n2]
+                    for n2 in by_name if n2 in self._last_metric_sample_t
+                ]
+                floor = max(floors) if floors else None
+                tmin = float(targets.min())
+                if floor is not None and tmin <= floor and recv > floor + 1e-6:
+                    a = (recv - floor - 1e-6) / (recv - tmin)
+                    targets = recv - (recv - targets) * a
+                i = 0
+                for name, batch in by_name.items():
+                    for s in batch:
+                        self._dispatch_monotonic(name, s, float(targets[i]))
+                        i += 1
+                return
+
+        # FALLBACK: per-metric uniform spread across (last, recv]. Used when
+        # the firmware didn't include per-sample timestamps (older builds,
+        # some metric configs) or the offset span was unreasonable.
+        for name, batch in by_name.items():
+            last = prev_recv.get(name)
+            n = len(batch)
             if n == 1 or last is None or recv <= last:
                 # Trivial case or first packet for this metric -- leave the
                 # timestamp at recv.
                 for s in batch:
                     self._dispatch_monotonic(name, s, s.recv_monotonic)
                 continue
-            # PREFERRED: use the firmware-emitted per-sample timestamps if
-            # this batch carries them. Buddy puts a relative offset (signed
-            # int, in microseconds back from "now-on-printer") at the end
-            # of each InfluxDB line: `loadcell_value v=12.3 -3693` means
-            # "this sample is 3.693 ms before the packet's emit instant".
-            # When the offsets look sane (monotonically ordered, within
-            # the packet's age) we anchor the newest sample to recv and
-            # apply the per-sample deltas. This preserves the actual
-            # firmware-side sampling cadence -- which is BURSTY at the
-            # ADC-batch level, not uniform -- and stops the live plot
-            # from looking stretched/compressed when the firmware emits a
-            # batch unevenly.
-            offsets_us = [s.printer_ts_ns for s in batch]
-            if all(o is not None for o in offsets_us):
-                arr = np.asarray(offsets_us, dtype=float) / 1e6  # us → s
-                # All negative-or-zero, the most-recent (largest = closest
-                # to 0) is the packet's "now" sample. Use that as the
-                # anchor at recv; subtract its value to get per-sample
-                # offsets back from the anchor.
-                anchor_offset = float(arr.max())
-                deltas = arr - anchor_offset  # all <= 0, in seconds
-                # Two sanity gates before trusting the firmware-offset
-                # spread:
-                #   (a) total span < 2× inter-packet gap, OR < 500 ms
-                #       (otherwise the timestamp unit is probably wrong
-                #       and the spread would corrupt the timeline);
-                #   (b) the resulting batch's EARLIEST sample lands
-                #       AFTER the previous packet's host arrival time --
-                #       otherwise the firmware-offset placement would
-                #       overlap the previous packet's coverage region
-                #       and we'd dispatch duplicate-time samples for
-                #       different ADC readings. Observed on the user's
-                #       run_1779015193.npz at K=0.05 seg 1: two
-                #       consecutive packets each spread ~60 ms back,
-                #       host inter-packet gap was ~15 ms, so packet B's
-                #       earliest samples landed ~45 ms BEFORE packet A's
-                #       latest -- plotly drew a backward diagonal on
-                #       the rising-edge line. Falling back to uniform
-                #       spread for the overlapping batch eliminates the
-                #       overlap (uniform spans only (last, recv]).
-                span_ok = (-float(deltas.min())) < max(2.0 * (recv - last), 0.5)
-                earliest_assigned = recv + float(deltas.min())
-                no_overlap = earliest_assigned >= last - 1e-6
-                if span_ok and no_overlap:
-                    for i, s in enumerate(batch):
-                        self._dispatch_monotonic(name, s, recv + float(deltas[i]))
-                    continue
-            # FALLBACK: uniform spread across (last, recv]. Used when the
-            # firmware didn't include timestamps (older builds, some
-            # metric configs) or the timestamp span was unreasonable.
             span = recv - last
             step = span / n
             for i, s in enumerate(batch):

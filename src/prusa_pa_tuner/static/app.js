@@ -1206,8 +1206,15 @@ function plotFit(divId, k, y, fit, yTitle, customdata) {
   }
   const traces = [trace];
   if (fit && fit.k_opt !== null) {
-    const xs = [Math.min(...k), Math.max(...k)];
-    const ys = xs.map((x) => fit.slope * x + fit.intercept);
+    // Quadratic fits carry a nonzero `quad` (k² coefficient); draw the
+    // actual curve so the user can eyeball the model against the data.
+    // Linear fits (quad 0/absent) only need the two endpoints.
+    const kMin = Math.min(...k), kMax = Math.max(...k);
+    const quad = Number.isFinite(fit.quad) ? fit.quad : 0;
+    const nPts = quad !== 0 ? 120 : 2;
+    const xs = [];
+    for (let i = 0; i < nPts; i++) xs.push(kMin + ((kMax - kMin) * i) / (nPts - 1));
+    const ys = xs.map((x) => quad * x * x + fit.slope * x + fit.intercept);
     traces.push({
       x: xs, y: ys, mode: "lines", type: "scatter",
       line: { color: "#2ea043", dash: "dash" },
@@ -1340,7 +1347,12 @@ function renderRun(run) {
 
   const pf = a.phase_fit, ig = a.integral_fit, igL = a.integral_legacy_fit;
   $("phase_k_opt").textContent = pf && pf.k_opt !== null ? pf.k_opt.toFixed(4) : "—";
-  $("phase_slope").textContent = pf ? pf.slope.toExponential(2) : "—";
+  // The server tries a quadratic first (method "phase_lag_quad") and
+  // falls back to the global line when no in-range descending crossing
+  // exists — surface which model produced the headline number.
+  $("phase_fit_kind").textContent = pf
+    ? (pf.method && pf.method.endsWith("_quad") ? "quadratic" : "linear fallback")
+    : "—";
   $("phase_r2").textContent = pf ? pf.r_squared.toFixed(3) : "—";
   $("integral_k_opt").textContent = ig && ig.k_opt !== null ? ig.k_opt.toFixed(4) : "—";
   $("integral_slope").textContent = ig ? ig.slope.toExponential(2) : "—";
@@ -1552,6 +1564,10 @@ function setMode(mode) {
     try { Plotly.Plots.resize("lm_plot"); } catch (_) {}
     try { Plotly.Plots.resize("probe_plot"); } catch (_) {}
     try { Plotly.Plots.resize("probe_touch_plot"); } catch (_) {}
+    for (const id of ["bd_segment_plot", "bd_cost_plot", "phase_plot",
+                      "integral_plot", "integral_legacy_plot", "signed_plot"]) {
+      try { Plotly.Plots.resize(id); } catch (_) {}
+    }
     if (mode === "livemap") lmapRequestRender();
   }, 50);
 }
@@ -2973,6 +2989,7 @@ function lmapSetupFromSummary(summary, mode, reviewFile) {
   _lmRenderSummaryText(summary);
   _lmRenderFeatureTable(summary.feature_stats || null);
   _lmRenderDivergence(summary.cross_check || null);
+  _lmRenderZDiag(summary.layer_diag || null);
   lmapRender();
 }
 
@@ -3023,7 +3040,75 @@ function _lmRenderDivergence(xc) {
     `<span style="color:${c}">plan vs telemetry: ${xc.agreement}</span> ` +
     `(scale ${fmt(xc.time_scale, 2)}×, kept ${fmt((xc.kept_fraction || 0) * 100, 0)}%` +
     (xc.n_travel_gcode != null ? `, ${xc.n_travel_gcode} travel pts masked` : "") +
+    (xc.layer_source ? `, layers: ${xc.layer_source === "pos_z" ? "pos_z staircase" : "arc length"}` : "") +
+    (xc.n_hole_breaks ? `, ${xc.n_hole_breaks} false connectors broken` : "") +
+    (xc.pos_pile_dropped ? `, ${xc.pos_pile_dropped} pile-up pts dropped` : "") +
     `)`;
+}
+
+// Verification plot for the layer detection: the median-filtered streamed-z
+// staircase with the detected layer boundaries, so a mis-assigned layer is
+// visible at a glance (a boundary line off a staircase step = wrong).
+function _lmRenderZDiag(ld) {
+  const div = $("lm_zdiag"), txt = $("lm_zdiag_txt");
+  if (!div || !txt) return;
+  if (!ld || !ld.available || !ld.stair_t || ld.stair_t.length < 2) {
+    div.style.display = "none";
+    txt.innerHTML = (ld && ld.reason)
+      ? `<span style="color:#d29922">layers from arc length — pos_z unusable: ${ld.reason}</span>`
+      : "";
+    return;
+  }
+  div.style.display = "";
+  const bounds = ld.boundaries || [];
+  const bgroup = (b) => b.method.startsWith("pos_z+travel") ? "travel"
+    : (b.method === "pos_z" ? "z" : "arc");
+  const nTrav = bounds.filter((b) => bgroup(b) === "travel").length;
+  const nZ = bounds.filter((b) => bgroup(b) === "z").length;
+  const nArc = bounds.filter((b) => bgroup(b) === "arc").length;
+  const shifts = bounds.map((b) => Math.abs(b.shift_s)).sort((a, b) => a - b);
+  const medShift = shifts.length ? shifts[Math.floor(shifts.length / 2)] : 0;
+  txt.innerHTML =
+    `MBL offset ${fmt(ld.offset, 2)} mm · z noise ±${fmt(ld.mad, 3)} mm · ` +
+    `boundaries: <span style="color:#2ea043">${nTrav} z+travel</span>` +
+    `${nZ ? `, <span style="color:#d29922">${nZ} z only</span>` : ""}` +
+    `${nArc ? `, <span style="color:#f85149">${nArc} arc fallback</span>` : ""}` +
+    ` · median shift vs arc-length estimate ${fmt(medShift, 1)} s`;
+
+  const t = ld.stair_t, z = ld.stair_z, zs = ld.layer_z || [];
+  const tmax = t[t.length - 1];
+  const pitch = ld.pitch || 0.2;
+  const ylo = (zs.length ? zs[0] : 0) - 1.5 * pitch;
+  const yhi = (zs.length ? zs[zs.length - 1] : 1) + 1.5 * pitch;
+  // faint horizontal line per gcode layer z
+  const hx = [], hy = [];
+  for (const lz of zs) { hx.push(0, tmax, null); hy.push(lz, lz, null); }
+  const bcolors = { travel: "#2ea043", z: "#d29922", arc: "#f85149" };
+  const btrace = (group) => {
+    const X = [], Y = [];
+    for (const b of bounds) {
+      if (bgroup(b) !== group) continue;
+      X.push(b.t_s, b.t_s, null); Y.push(ylo, yhi, null);
+    }
+    return {
+      x: X, y: Y, type: "scattergl", mode: "lines",
+      line: { color: bcolors[group], width: 1 }, hoverinfo: "skip", showlegend: false,
+    };
+  };
+  const traces = [
+    { x: hx, y: hy, type: "scattergl", mode: "lines",
+      line: { color: "#2a313c", width: 1 }, hoverinfo: "skip", showlegend: false },
+    btrace("travel"), btrace("z"), btrace("arc"),
+    { x: t, y: z, type: "scattergl", mode: "lines",
+      line: { color: "#58a6ff", width: 1.5 }, hoverinfo: "x+y", showlegend: false },
+  ];
+  Plotly.react(div, traces, {
+    margin: { l: 44, r: 10, t: 6, b: 30 },
+    paper_bgcolor: "#161b22", plot_bgcolor: "#0d1117",
+    font: { color: "#e6edf3", size: 10 },
+    xaxis: { gridcolor: "#21262d", title: "t since print start (s)" },
+    yaxis: { gridcolor: "#21262d", title: "z (mm)", range: [ylo, yhi] },
+  }, { displayModeBar: false, responsive: true });
 }
 
 async function lmapUpload() {
@@ -3259,7 +3344,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const m = localStorage.getItem("ppat_mode");
     if (m === "flow") setMode("flow");
     else if (m === "livemap") setMode("livemap");
-    else if (m === "probe") setMode("probe");
+    // "probe" intentionally not restored — Touch Probe tab is hidden until hardware-tested.
   } catch (_) {}
 
   // Annotation card (only visible after a replay is loaded).

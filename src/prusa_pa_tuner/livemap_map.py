@@ -9,12 +9,20 @@ constant, so the error grew across the print and smeared the colours -- exactly
 what we're avoiding here.)
 
 Per sample we need: position (real, above), layer, whether it's a travel, and
-which feature it belongs to. None of those may use pos_z (on this hardware it
-carries MBL/raw-encoder noise spanning ±168 mm). So:
+which feature it belongs to.
 
-  * layer  -- from cumulative arc length (streamed XY distance ≈ gcode path
-              distance). Drift-tolerant: layer bands are thousands of mm apart,
-              so even tens of mm of arc-length error can't flip the layer.
+  * layer  -- PRIMARY: the pos_z staircase. Raw pos_z carries junk spikes
+              (MBL/encoder artefacts spanning ±168 mm), but ~2/3 of samples
+              are the true z, so a rolling MEDIAN recovers a clean staircase
+              (verified on livemap_1781710258: 0.31→0.70→…→5.10, i.e. the
+              layer heights plus a constant MBL offset). We detect the
+              staircase STEP TIMES (robust to that offset) and snap each one
+              to the nearest travel -- a layer change is always a travel.
+              FALLBACK: cumulative arc length (streamed XY distance ≈ gcode
+              path distance). That estimate drifts by tens of mm within a
+              layer (interp corner-cutting shortens the streamed path,
+              unevenly across layers), which visibly bled the end of layer N
+              into layer N+1 before the pos_z path existed.
   * travel -- from the real-position SPEED. Travels run faster than any
               extrusion feedrate; the threshold is derived from the gcode.
               Drift-free.
@@ -52,6 +60,26 @@ _BREAK_JUMP_MM = 12.0
 # wrong-angle lines). We can't trust that position, so we drop the sample and
 # break the line there. ~2x the nominal 13 ms spacing (one missing pos sample).
 _POS_GAP_MAX_S = 0.025
+# Timestamp PILE-UP in a position stream: two samples closer than this are
+# not a real 78 Hz cadence -- they're the seam where overlapping UDP batches
+# were squeezed together (the value can step ~1 mm within ~0.1 ms). Positions
+# interpolated near such a seam are laterally wrong (on 45° infill they land
+# on the ADJACENT line), so we drop force samples within the radius below.
+_POS_PILE_MIN_DT = 0.004
+_POS_PILE_RADIUS_S = 0.02
+# The force stream arrives in bursts (~3 ms spacing) separated by ~30 ms
+# holes (firmware metric-buffer batching). A hole whose two bracketing kept
+# samples sit on DIFFERENT infill lines used to be drawn as a straight
+# connector cutting across the part. We break the line over a hole when the
+# gcode arc-length advance between the two snaps disagrees with the straight
+# chord (the head went around a turn during the hole); an along-line hole
+# (advance ≈ chord) stays connected, so no false dashing.
+_HOLE_BREAK_S = 0.015
+_HOLE_MISMATCH_MM = 0.5
+# pos_z staircase layer detection (see module docstring).
+_Z_MED_WIN = 51            # rolling-median window (~0.65 s at 78 Hz)
+_Z_MAD_MAX_FRAC = 0.45     # give up when residual MAD > this × layer pitch
+_Z_TRAVEL_SNAP = 400       # snap a z boundary to a travel within ± this many samples
 
 
 @dataclass(slots=True)
@@ -71,6 +99,9 @@ class MappedRun:
     force_hi: float = 1.0
     feature_stats: dict[str, dict[str, float]] = field(default_factory=dict)
     cross: dict[str, Any] = field(default_factory=dict)
+    # pos_z staircase layer detection: source, per-boundary methods/shifts and
+    # a downsampled staircase for the UI verification plot.
+    layer_diag: dict[str, Any] = field(default_factory=dict)
 
 
 def _interp_axis(qt, st, sv):
@@ -90,6 +121,199 @@ def _interp_gap(qt, st):
     st = np.asarray(st, dtype=float)
     j = np.clip(np.searchsorted(st, qt), 1, len(st) - 1)
     return st[j] - st[j - 1]
+
+
+def _pileup_mask(qt: np.ndarray, st) -> np.ndarray:
+    """True where a query time sits within _POS_PILE_RADIUS_S of a timestamp
+    pile-up in the source stream (two source samples < _POS_PILE_MIN_DT
+    apart). Interpolation near such a seam is untrustworthy."""
+    if st is None or len(np.atleast_1d(st)) < 2:
+        return np.zeros(len(qt), dtype=bool)
+    st = np.asarray(st, dtype=float)
+    piles = st[1:][np.diff(st) < _POS_PILE_MIN_DT]
+    if not piles.size:
+        return np.zeros(len(qt), dtype=bool)
+    j = np.searchsorted(piles, qt)
+    near = np.full(len(qt), np.inf)
+    m = j > 0
+    near[m] = qt[m] - piles[j[m] - 1]
+    m = j < len(piles)
+    near[m] = np.minimum(near[m], piles[j[m]] - qt[m])
+    return near < _POS_PILE_RADIUS_S
+
+
+def _rolling_median(a: np.ndarray, w: int) -> np.ndarray:
+    if w <= 1 or a.size < w:
+        return a
+    from numpy.lib.stride_tricks import sliding_window_view
+    pad = w // 2
+    ap = np.pad(a, pad, mode="edge")
+    return np.median(sliding_window_view(ap, w), axis=1)
+
+
+def _turn_fold_mask(qt: np.ndarray, sxt, sx_, syt, sy_) -> np.ndarray:
+    """True where a query time falls inside a position-stream interval that
+    hides a direction REVERSAL (a zigzag turnaround folded between two ~13 ms
+    position samples). Interpolation across such an interval returns points
+    on the fold's chord -- laterally between the two infill lines -- which
+    the snap then flips onto either line, drawing little cross-links near
+    the line ends. Detection: the directions entering and leaving interval j
+    oppose (dot < -0.17·|a||b|) while the interval's own chord is short
+    (the fold ate path length)."""
+    if sxt is None or sx_ is None or len(np.atleast_1d(sxt)) < 4:
+        return np.zeros(len(qt), dtype=bool)
+    xt = np.asarray(sxt, dtype=float)
+    X_ = np.asarray(sx_, dtype=float)
+    Y_ = _interp_axis(xt, syt, sy_)
+    dx = np.diff(X_)
+    dy = np.diff(Y_)
+    ln = np.hypot(dx, dy)
+    # interval j is bounded by directions j-1 (in) and j+1 (out)
+    d_in_x, d_in_y, l_in = dx[:-2], dy[:-2], ln[:-2]
+    d_out_x, d_out_y, l_out = dx[2:], dy[2:], ln[2:]
+    l_mid = ln[1:-1]
+    dot = d_in_x * d_out_x + d_in_y * d_out_y
+    fold = (
+        (dot < -0.17 * l_in * l_out)
+        & (l_in > 0.05) & (l_out > 0.05)
+        & (l_mid < 0.7 * 0.5 * (l_in + l_out))
+    )
+    out = np.zeros(len(qt), dtype=bool)
+    if not fold.any():
+        return out
+    j = np.clip(np.searchsorted(xt, qt, side="right") - 1, 0, len(xt) - 2)
+    inner = (j >= 1) & (j <= len(xt) - 3)
+    out[inner] = fold[j[inner] - 1]
+    return out
+
+
+def _layers_from_pos_z(
+    wt: np.ndarray,
+    wlayer: np.ndarray,
+    pos_z_t, pos_z,
+    layer_z: list[float],
+    trav: np.ndarray,
+    wx: np.ndarray | None = None,
+    wy: np.ndarray | None = None,
+    layer_start_xy: list[tuple[float, float]] | None = None,
+) -> tuple[np.ndarray | None, dict[str, Any]]:
+    """Per-window-sample layer indices from the pos_z staircase.
+
+    Raw pos_z is ~1/3 junk spikes, but a rolling median recovers the true z
+    staircase (layer heights + a constant MBL offset). The offset is estimated
+    against the coarse arc-length layer (median residual -- robust because the
+    coarse layer is right for the vast majority of samples), then each layer
+    boundary is located as the offset-corrected median-z crossing of the
+    midpoint between the two layers' z values, searched near the coarse
+    transition, and finally snapped to the end of a nearby travel run (a
+    layer change is always a travel, so no boundary can split an extrusion).
+    The z crossing has ~0.3 s of median-filter slop, so among candidate
+    travel runs we PREFER one whose exit position matches where the gcode
+    says the next layer starts (`layer_start_xy`), and only fall back to the
+    nearest run -- otherwise a mid-layer travel can steal the boundary.
+
+    Returns (wlayer_refined, diag); (None, diag-with-reason) when pos_z can't
+    be trusted, in which case the caller keeps the coarse arc-length layers.
+    """
+    n = len(wt)
+    diag: dict[str, Any] = {"available": False, "reason": "", "source": "arc_length"}
+    if (pos_z_t is None or pos_z is None
+            or len(np.atleast_1d(pos_z)) < _Z_MED_WIN or len(layer_z) < 2):
+        diag["reason"] = "no usable pos_z stream"
+        return None, diag
+    zs = np.asarray(layer_z, dtype=float)
+    pitch = float(np.median(np.diff(zs)))
+    if not pitch > 0.02:
+        diag["reason"] = "layer pitch too small for pos_z banding"
+        return None, diag
+
+    zm = _rolling_median(np.asarray(pos_z, dtype=float), _Z_MED_WIN)
+    z_s = np.interp(wt, np.asarray(pos_z_t, dtype=float), zm)
+    resid = z_s - zs[np.clip(wlayer, 0, len(zs) - 1)]
+    offset = float(np.median(resid))
+    mad = float(np.median(np.abs(resid - offset)))
+    diag.update({"offset": offset, "mad": mad, "pitch": pitch})
+    if mad > _Z_MAD_MAX_FRAC * pitch:
+        diag["reason"] = (
+            f"pos_z too noisy for layer banding (median |resid| {mad:.3f} mm "
+            f"vs layer pitch {pitch:.3f} mm)")
+        return None, diag
+    zc = z_s - offset
+
+    counts = np.bincount(np.clip(wlayer, 0, len(zs) - 1), minlength=len(zs))
+    bounds: list[int] = []
+    binfo: list[dict[str, Any]] = []
+    prev_b = 0
+    for k in range(1, len(zs)):
+        c_k = int(np.searchsorted(wlayer, k))          # coarse boundary
+        W = int(np.clip(0.6 * max(1, min(counts[k - 1], counts[k])), 50, 20000))
+        lo = max(prev_b + 1, c_k - W)
+        hi = min(n - 1, c_k + W)
+        method = "arc"
+        b = min(max(c_k, prev_b + 1), n - 1)
+        if hi > lo:
+            mid_z = 0.5 * (zs[k - 1] + zs[k])
+            above = zc[lo:hi + 1] >= mid_z
+            edges = np.where(above[1:] & ~above[:-1])[0] + 1 + lo
+            if edges.size:
+                # the upward crossing nearest the coarse estimate
+                b = int(edges[np.argmin(np.abs(edges - c_k))])
+                method = "pos_z"
+        if method == "pos_z":
+            # snap to the END of a travel run near the z crossing: the layer
+            # change is a travel, so the boundary must not split an
+            # extrusion. Prefer the run whose exit lands where the gcode
+            # says layer k starts; among equals take the one nearest the
+            # z crossing.
+            lo2 = max(0, b - _Z_TRAVEL_SNAP)
+            hi2 = min(n - 1, b + _Z_TRAVEL_SNAP)
+            tm = trav[lo2:hi2 + 1].astype(np.int8)
+            e = np.diff(np.r_[0, tm, 0])
+            r_starts = np.where(e == 1)[0] + lo2
+            r_ends = np.where(e == -1)[0] + lo2      # exclusive end
+            best_key = None
+            best_b = None
+            sxy = layer_start_xy[k] if layer_start_xy and k < len(layer_start_xy) else None
+            for s0, e0 in zip(r_starts, r_ends):
+                if e0 >= n:
+                    continue
+                match = 1
+                if (sxy is not None and wx is not None
+                        and np.isfinite(wx[e0]) and np.isfinite(wy[e0])
+                        and np.hypot(wx[e0] - sxy[0], wy[e0] - sxy[1]) < 3.0):
+                    match = 0                        # exits at the layer's start point
+                key = (match, abs((s0 + e0) // 2 - b))
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best_b = int(e0)
+            if best_b is not None:
+                b = best_b
+                method = "pos_z+travel" if best_key[0] else "pos_z+travel+start"
+        b = min(max(b, prev_b + 1), n - 1)
+        bounds.append(b)
+        prev_b = b
+        binfo.append({
+            "into_layer": int(k),
+            "t_s": float(wt[b] - wt[0]),
+            "coarse_t_s": float(wt[min(c_k, n - 1)] - wt[0]),
+            "shift_s": float(wt[b] - wt[min(c_k, n - 1)]),
+            "method": method,
+        })
+
+    out = np.zeros(n, dtype=int)
+    for b in bounds:
+        out[b:] += 1
+    ds = np.linspace(0, n - 1, min(n, 1500)).astype(int)
+    diag.update({
+        "available": True,
+        "source": "pos_z",
+        "n_pos_z_boundaries": sum(1 for x in binfo if x["method"].startswith("pos_z")),
+        "boundaries": binfo,
+        "stair_t": [float(v) for v in (wt[ds] - wt[0])],
+        "stair_z": [float(round(v, 4)) for v in zc[ds]],
+        "layer_z": [float(v) for v in zs],
+    })
+    return out, diag
 
 
 def _longest_run(mask: np.ndarray, fs: float) -> tuple[int, int] | None:
@@ -200,7 +424,7 @@ def map_run(
     force_t, force_y,
     pos_t, pos_x,
     pos_y_t, pos_y,
-    pos_z_t, pos_z,          # accepted for signature compat; NOT used (MBL noise)
+    pos_z_t, pos_z,          # rolling-median staircase -> layer boundaries
     parsed: ParsedGcode,
 ) -> MappedRun:
     ft = np.asarray(force_t, dtype=float)
@@ -308,10 +532,33 @@ def map_run(
     n_travel_gcode = int(trav_g.sum())
     trav = trav | trav_g
 
+    # --- refine LAYER with the pos_z staircase (needs `trav` for the travel
+    # snap, and each layer's gcode start point to pick the RIGHT travel).
+    # Falls back to the coarse arc-length layers when pos_z is missing/too
+    # noisy; `layer_diag` records which source won and why. ---
+    layer_starts: list[tuple[float, float]] = []
+    for lyr in parsed.layers:
+        p0 = (float("nan"), float("nan"))
+        for mv in parsed.moves[lyr.move_lo:lyr.move_hi]:
+            if mv.extruding:
+                p0 = (mv.x0, mv.y0)
+                break
+        layer_starts.append(p0)
+    wlayer_z, layer_diag = _layers_from_pos_z(
+        wt, wlayer, pos_z_t, pos_z, [lyr.z for lyr in parsed.layers], trav,
+        wx, wy, layer_starts)
+    if wlayer_z is not None:
+        wlayer = wlayer_z
+
     # Drop samples whose REAL position was interpolated across a wide position
-    # gap (untrustworthy -- straight chord across an unknown turn/travel).
+    # gap (untrustworthy -- straight chord across an unknown turn/travel),
+    # near a timestamp pile-up seam (laterally wrong on diagonal moves), or
+    # inside an interval that hides a zigzag turnaround (chord cuts the
+    # corner between two infill lines).
     pos_gap = np.maximum(_interp_gap(wt, pos_t), _interp_gap(wt, pos_y_t))
-    pos_ok = pos_gap < _POS_GAP_MAX_S
+    pos_pile = _pileup_mask(wt, pos_t) | _pileup_mask(wt, pos_y_t)
+    pos_fold = _turn_fold_mask(wt, pos_t, pos_x, pos_y_t, pos_y)
+    pos_ok = (pos_gap < _POS_GAP_MAX_S) & ~pos_pile & ~pos_fold
 
     is_print = (~trav) & pos_ok & np.isfinite(wf) & np.isfinite(wx) & np.isfinite(wy)
 
@@ -364,6 +611,33 @@ def map_run(
         snap_x[sel] = cx; snap_y[sel] = cy
         snap_s[sel] = Sg[gm] + fr * seg_len[gm]
         s_feat[sel] = pm_feat[gm]
+
+    # --- break the line over force-stream HOLES that hide a turn. The force
+    # stream arrives in ~3 ms bursts with ~30 ms holes; a hole spanning a
+    # zigzag turnaround leaves its two bracketing samples adjacent in the
+    # stream (no index gap, jump << _BREAK_JUMP_MM) but on DIFFERENT infill
+    # lines -- drawn, that's a false connector cutting across the part. The
+    # tell is the gcode: going around the turn advances the arc length far
+    # more than the straight chord. Along-line holes (advance ≈ chord) stay
+    # connected, so the line doesn't dash at every batch boundary. ---
+    n_hole_breaks = 0
+    kt = wt[is_print]
+    if s_xr.size > 1:
+        dt_k = np.diff(kt)
+        chord = np.hypot(np.diff(s_xr), np.diff(s_yr))
+        adv = np.diff(snap_s)
+        # gate 1: arc advance disagrees with the chord (turn went around)
+        mism = np.abs(adv - chord) > np.maximum(_HOLE_MISMATCH_MM, 0.35 * chord)
+        # gate 2: the head should have covered ~dt × local speed of path
+        # during the hole; a chord far shorter than that means it doubled
+        # back (a turnaround the snap mis-attributed, so gate 1 missed it)
+        v_loc = _rolling_median(chord / np.maximum(dt_k, 1e-6), 15)
+        expected = dt_k * v_loc
+        short = (expected - np.maximum(chord, np.abs(adv))) > np.maximum(1.0, 0.5 * expected)
+        hole_brk = (dt_k > _HOLE_BREAK_S) & (mism | short) & ~s_brk[1:]
+        n_hole_breaks = int(hole_brk.sum())
+        s_brk[1:] |= hole_brk
+
     s_x, s_y = _consistency_reject(snap_x, snap_y, snap_s, s_xr, s_yr, s_brk)
 
     if s_force.size:
@@ -403,7 +677,11 @@ def map_run(
         "print_end_s": float(ft[end] - ft[0]),
         "travel_speed_threshold": float(thresh),
         "n_travel_gcode": n_travel_gcode,
-        "pos_gap_dropped": int((~pos_ok).sum()),
+        "pos_gap_dropped": int((pos_gap >= _POS_GAP_MAX_S).sum()),
+        "pos_pile_dropped": int((pos_pile & (pos_gap < _POS_GAP_MAX_S)).sum()),
+        "pos_fold_dropped": int((pos_fold & ~pos_pile & (pos_gap < _POS_GAP_MAX_S)).sum()),
+        "n_hole_breaks": n_hole_breaks,
+        "layer_source": layer_diag.get("source", "arc_length"),
         "n_samples": int(s_force.size),
     }
 
@@ -411,7 +689,7 @@ def map_run(
         parsed=parsed, s_x=s_x, s_y=s_y, s_xr=s_xr, s_yr=s_yr, s_force=s_force,
         s_layer=s_layer, s_feat=s_feat, s_brk=s_brk,
         tare=tare, force_lo=force_lo, force_hi=force_hi,
-        feature_stats=feature_stats, cross=cross,
+        feature_stats=feature_stats, cross=cross, layer_diag=layer_diag,
     )
 
 
@@ -434,6 +712,7 @@ def mapped_summary(m: MappedRun, filename: str = "") -> dict[str, Any]:
         "layer_zs": layer_zs(m.parsed),
         "feature_stats": m.feature_stats,
         "cross_check": m.cross,
+        "layer_diag": m.layer_diag,
         "layers": layers,
     }
 

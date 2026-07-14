@@ -7,7 +7,7 @@ from prusa_pa_tuner.gcode_parse import (
     parse_gcode,
 )
 from prusa_pa_tuner.livemap_gen import build_livemap_gcode
-from prusa_pa_tuner.livemap_map import layer_detail, map_run
+from prusa_pa_tuner.livemap_map import _layers_from_pos_z, layer_detail, map_run
 from prusa_pa_tuner.livemap_runner import LiveMapRun, _dump_livemap_run, replay_livemap
 
 
@@ -198,6 +198,100 @@ def test_layer_detail_emits_ordered_points():
     assert len(p["y"]) == len(p["f"]) == len(p["feat"]) == len(p["brk"]) == n
     assert d["n_points"] == n
     assert d["polylines"]  # faint backdrop still present
+
+
+def test_pos_z_staircase_overrides_drifting_arc_length_boundary():
+    """The coarse arc-length layer estimate drifts (observed up to ~130 mm of
+    path on livemap_1781710258 -- the layer-bleed bug). The pos_z staircase
+    must relocate the boundary to the true z step and snap it to the end of
+    the travel there, even with a constant MBL offset and 25% junk spikes."""
+    n = 4000
+    wt = np.linspace(0.0, 40.0, n)
+    # coarse (arc-length) estimate puts the boundary at 60% -- drifted late
+    wlayer = np.zeros(n, dtype=int)
+    wlayer[int(0.6 * n):] = 1
+    # ground truth: z steps at 50%, where there is also a travel
+    true_b = int(0.5 * n)
+    pz = np.where(np.arange(n) < true_b, 0.2, 0.4) + 0.1  # +0.1 = MBL offset
+    rng = np.random.default_rng(1)
+    junk = rng.random(n) < 0.25
+    pz[junk] = 168.0  # encoder/MBL junk spikes
+    trav = np.zeros(n, dtype=bool)
+    trav[true_b - 5:true_b + 5] = True
+    out, diag = _layers_from_pos_z(wt, wlayer, wt, pz, [0.2, 0.4], trav)
+    assert out is not None and diag["available"] is True
+    assert diag["source"] == "pos_z"
+    assert diag["boundaries"][0]["method"] == "pos_z+travel"
+    b = int(np.searchsorted(out, 1))
+    # boundary lands at the end of the travel run (true_b + 5), not at the
+    # drifted 60% mark; allow slack for the median-filter edge
+    assert abs(b - (true_b + 5)) <= 30
+    # MBL offset was estimated away
+    assert abs(diag["offset"] - 0.1) < 0.03
+
+
+def test_map_run_layers_from_noisy_pos_z():
+    """End-to-end: map_run must take its layers from the pos_z staircase even
+    when pos_z carries a constant offset plus junk spikes, and must say so in
+    the cross-check."""
+    pg = parse_gcode(SAMPLE)
+    t, X, Y, Z, F = _synthesize_streams(pg)
+    rng = np.random.default_rng(2)
+    Zn = Z + 0.12
+    junk = rng.random(Zn.size) < 0.25
+    Zn[junk] = 168.0
+    m = map_run(t, F, t, X, t, Y, t, Zn, pg)
+    assert m.cross["layer_source"] == "pos_z"
+    assert m.layer_diag["available"] is True
+    for li in range(len(pg.layers)):
+        assert np.count_nonzero(m.s_layer == li) > 0
+
+
+# One layer, two long parallel infill lines joined by a U-turn -- the shape
+# where a force-stream hole used to draw a false connector across the lines.
+TURN_GCODE = """G90
+M83
+;LAYER_CHANGE
+;Z:0.2
+;TYPE:Internal infill
+G1 X0 Y0 Z0.2 F9000
+G1 X30 Y0 E1.0 F1800
+G1 X30 Y0.4 E0.02
+G1 X0 Y0.4 E1.0
+"""
+
+
+def test_force_hole_over_turnaround_breaks_the_line():
+    """A ~60 ms force-stream hole spanning the U-turn leaves its bracketing
+    samples adjacent in the stream and only ~0.5 mm apart in XY -- the old
+    logic drew a straight connector cutting between the lines. The arc-length
+    advance over the hole (~1.8 mm around the turn) disagrees with the chord,
+    so the mapper must break the line there."""
+    pg = parse_gcode(TURN_GCODE)
+    t, X, Y, Z, F = _synthesize_streams(pg, fs=240.0)
+    # time at which the head reaches the end of line 1 (x = 30)
+    t_turn = float(t[np.argmax(X >= 29.999)])
+    keep = ~((t > t_turn - 0.05) & (t < t_turn + 0.05))
+    m = map_run(t[keep], F[keep], t, X, t, Y, t, Z, pg)
+    assert m.cross["n_hole_breaks"] >= 1
+    # no drawn connector crosses between the two lines: every non-break step
+    # stays under half the line spacing in y
+    dy = np.abs(np.diff(m.s_y))
+    conn = ~m.s_brk[1:]
+    assert dy[conn].max() < 0.2
+
+
+def test_pos_pileup_drops_untrusted_samples():
+    """Two pos_y timestamps squeezed ~0.1 ms apart (the seam of overlapping
+    UDP batches) make interpolated positions laterally wrong nearby; those
+    force samples must be dropped and counted."""
+    pg = parse_gcode(SAMPLE)
+    t, X, Y, Z, F = _synthesize_streams(pg)
+    ty = t.copy()
+    k = int(0.6 * len(ty))
+    ty[k] = ty[k - 1] + 1e-4  # pile-up seam mid-print
+    m = map_run(t, F, t, X, ty, Y, t, Z, pg)
+    assert m.cross["pos_pile_dropped"] > 0
 
 
 def test_npz_roundtrip_replay(tmp_path, monkeypatch):

@@ -286,6 +286,7 @@ def _fit_to_dict(f) -> dict[str, Any] | None:
         "intercept": _safe_float(f.intercept),
         "r_squared": _safe_float(f.r_squared),
         "method": f.method,
+        "quad": _safe_float(f.quad),
     }
 
 

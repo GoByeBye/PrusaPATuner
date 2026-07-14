@@ -41,7 +41,8 @@
       <button id="mode_pa" type="button" class="active">PA Tuning</button>
       <button id="mode_flow" type="button">Max Flow</button>
       <button id="mode_livemap" type="button">Live Map</button>
-      <button id="mode_probe" type="button">Touch Probe</button>
+      <!-- Touch Probe is implemented but not yet hardware-tested; hidden until then. -->
+      <button id="mode_probe" type="button" hidden>Touch Probe</button>
     </div>
     <section class="card">
       <h2>1. Printer</h2>
@@ -252,6 +253,14 @@
         <button id="lm_export" type="button" title="Export the selected run's loadcell trace (timestamp + nozzle force) to .xlsx">⬇ XLSX</button>
       </div>
       <div id="lm_run_meta" class="meta" style="margin-top:4px;"></div>
+      <h3 style="margin-top:12px;">Layer detection</h3>
+      <div class="meta">How samples were assigned to layers. The staircase is the median-filtered
+        streamed z; vertical lines are the detected layer boundaries
+        (<span style="color:#2ea043">green</span> = z step snapped to a travel,
+        <span style="color:#d29922">orange</span> = z step only,
+        <span style="color:#f85149">red</span> = arc-length fallback).</div>
+      <div id="lm_zdiag_txt" class="meta" style="margin-top:4px;"></div>
+      <div id="lm_zdiag" style="width:100%;height:200px;display:none;"></div>
       <h3 style="margin-top:12px;">Nozzle load by feature</h3>
       <div class="meta">Tared force per feature type, aggregated over the run.</div>
       <table id="lm_feature_table" class="bd-metric-table" style="margin-top:6px;"></table>
@@ -611,8 +620,8 @@
       </div>
     </section>
 
-    <section class="card">
-      <h2>Results — linear-fit zero-crossing (comparison)</h2>
+    <section class="card pa-view">
+      <h2>Results — fit zero-crossing (comparison)</h2>
       <div class="meta">
         U1/Snapmaker-style metrics. The integral-area fit uses a 150 ms
         transition window (≈ one melt-pressure τ) and a per-cycle local
@@ -620,13 +629,17 @@
         a cycle the bd analysis excluded (dropouts in the critical zone,
         sample rate &lt; 40 Hz, signal-below-noise) is excluded here too.
         Hover a point to see how many cycles survived for that K. Phase-lag
-        and legacy-integral are kept for visual comparison only.
+        and legacy-integral are kept for visual comparison only. The
+        phase-lag fit is a quadratic (the lag response saturates at high K,
+        which drags a straight line's crossing high); when the lag never
+        crosses zero in-range it falls back to a global linear fit and the
+        model label below reads "linear fallback".
       </div>
       <div class="row">
         <div class="result-block">
           <h3>Phase-lag fit</h3>
           <div id="phase_k_opt" class="big">—</div>
-          <div class="meta">slope=<span id="phase_slope">—</span> · R²=<span id="phase_r2">—</span></div>
+          <div class="meta">model=<span id="phase_fit_kind">—</span> · R²=<span id="phase_r2">—</span></div>
           <div id="phase_plot" style="width:100%;height:240px;"></div>
         </div>
         <div class="result-block">

@@ -186,10 +186,13 @@ def test_packet_batch_falls_back_to_uniform_when_no_timestamps():
 
 def test_packet_overlap_falls_back_to_uniform_to_keep_monotonic():
     """When the firmware-offset spread would place the new packet's
-    earliest sample BEFORE the previous packet's host arrival time
-    (because host inter-packet gap < firmware batch span), the
-    dispatcher must fall back to uniform spread to avoid out-of-order
-    timestamps in the per-metric stream.
+    earliest sample BEFORE the previous packet's samples (because host
+    inter-packet gap < firmware batch span), the dispatcher must keep
+    the per-metric stream monotonic. (It now does so by compressing
+    the whole packet into (floor, recv] with one shared affine map --
+    NOT by a per-metric uniform-spread fallback, which desynced pos_x
+    from pos_y -- but the invariant under test is unchanged: strictly
+    increasing timestamps.)
 
     Regression for run_1779015193.npz K=0.05 seg 1: two consecutive
     packets each carried ~60ms-span batches but arrived only ~15ms
@@ -261,6 +264,53 @@ def test_packet_overlap_falls_back_to_uniform_to_keep_monotonic():
     # 100.005, 100.010, 100.015.
     # The exact values depend on the spread formula; the strict
     # monotonicity test above is what actually matters.
+
+
+def test_multi_metric_packet_keeps_streams_paired():
+    """pos_x and pos_y samples taken at the same firmware instant (same
+    per-line µs offset, same packet) must get the SAME host timestamp --
+    including when the packet overlaps the previous one and gets
+    compressed. The old per-metric logic could route pos_x and pos_y
+    through different paths (one offset-spread, one uniform/clipped),
+    skewing them by up to a batch period; on 45° moves that skew
+    displaced the interpolated toolhead sideways by up to ~1 mm and the
+    Live Map drew force on the ADJACENT infill line."""
+    stream = MetricStream(port=0)
+    captured: dict[str, list[float]] = {"pos_x": [], "pos_y": []}
+
+    import prusa_pa_tuner.udp_metrics as udp_mod
+    original_monotonic = udp_mod.time.monotonic
+    # Seed packet at 100.0 (pos_x only -- so pos_x has prior state and
+    # pos_y does not, the exact asymmetry that used to split the paths),
+    # then a two-metric packet at 100.005 whose 12 ms offset span
+    # overlaps the seed -> packet-wide compression must kick in.
+    times = iter([100.0, 100.005])
+    udp_mod.time.monotonic = lambda: next(times)
+    try:
+        stream._on_packet(b"pos_x v=1.0 0", ("t", 0))
+        original_dispatch = stream._dispatch
+        def capture(sample):
+            if sample.name in captured:
+                captured[sample.name].append(sample.recv_monotonic)
+            return original_dispatch(sample)
+        stream._dispatch = capture
+        packet = b"\n".join([
+            b"pos_x v=10.0 -12000",
+            b"pos_x v=11.0 0",
+            b"pos_y v=20.0 -12000",
+            b"pos_y v=21.0 0",
+        ])
+        stream._on_packet(packet, ("t", 0))
+    finally:
+        udp_mod.time.monotonic = original_monotonic
+
+    assert len(captured["pos_x"]) == 2 and len(captured["pos_y"]) == 2
+    # simultaneous samples share one timestamp across metrics
+    assert captured["pos_x"][0] == pytest.approx(captured["pos_y"][0], abs=1e-9)
+    assert captured["pos_x"][1] == pytest.approx(captured["pos_y"][1], abs=1e-9)
+    # and each stream stays strictly monotonic despite the overlap
+    assert captured["pos_x"][1] > captured["pos_x"][0]
+    assert captured["pos_y"][1] > captured["pos_y"][0]
 
 
 def test_syslog_header_meta_is_captured():
