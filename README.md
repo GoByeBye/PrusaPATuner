@@ -58,6 +58,16 @@ on the printer's stock loadcell over UDP.
 If your Prusa runs current Buddy firmware and has loadcell-based first-layer
 calibration, it has what this tool needs.
 
+### Klipper
+
+Not supported directly — this tool speaks Buddy's G-codes and UDP metrics protocol.
+However, [KAPAT](https://github.com/vzagranichnyy/KAPAT) is a community port
+([#1](https://github.com/CNCKitchen/PrusaPATuner/issues/1)) that runs the same sweep
+and analysis on Klipper: it reads a Mellow ALPS loadcell through Klipper's
+`bulk_sensor` API and forwards the samples over UDP in place of Buddy's metrics
+stream. Not maintained or tested by this project, but a good starting point if your
+printer runs Klipper.
+
 ## How it works
 
 1. The tool generates a single G-code job that sweeps K (`M572 S<k>`) across a
@@ -384,6 +394,8 @@ make your modifications available to that service's users.
   motion geometry and integral-area math.
 - [markniu/bd_pressure](https://github.com/markniu/bd_pressure) — step-response
   decomposition and composite-cost K selection.
+- [vzagranichnyy/KAPAT](https://github.com/vzagranichnyy/KAPAT) — community Klipper
+  port of this tool using a Mellow ALPS loadcell and Klipper's `bulk_sensor` API.
 - [Ellis 3DP Print Tuning Guide](https://ellis3dp.com/Print-Tuning-Guide/articles/pressure_linear_advance/introduction.html)
   — physics framing and PA intuition.
 - [Prusa firmware-specific G-code reference](https://help.prusa3d.com/article/prusa-firmware-specific-g-code-commands_112173)
