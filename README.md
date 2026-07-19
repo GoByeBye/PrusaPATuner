@@ -12,7 +12,8 @@ corner artefacts.
 This repository is a fork of
 [`CNCKitchen/PrusaPATuner`](https://github.com/CNCKitchen/PrusaPATuner). It preserves
 the upstream Git history and AGPL license; fork-specific changes currently focus on
-CORE One INDX support and more robust live-map tracking.
+CORE One INDX support and more robust live-map tracking. See [`NOTICE.md`](NOTICE.md)
+for attribution and the fork's AI-assistance disclosure.
 
 ## Research project
 
