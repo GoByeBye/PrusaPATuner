@@ -49,7 +49,10 @@ from dataclasses import dataclass
 
 from .gcode_preamble import (
     PROBE_MARKER_PREFIX,
+    finish_selected_tool,
     firmware_asserts,
+    home_selected_tool,
+    is_indx,
     metric_setup,
     slicer_header,
     sweep_end_marker,
@@ -59,6 +62,10 @@ from .gcode_preamble import (
 
 @dataclass(slots=True)
 class ProbeParams:
+    nozzle_diameter: float = 0.4
+    printer_model: str = "COREONE"
+    tool_index: int = 0
+
     # --- direction the head moves to find the part ---
     probe_axis: str = "X"          # "X" or "Y"
     probe_dir: str = "+"           # "+" or "-"
@@ -154,11 +161,12 @@ def build_probe_test(params: ProbeParams) -> ProbePlan:
     slicer_header(
         lines,
         label=p.label,
-        nozzle_diameter=0.4,
+        nozzle_diameter=p.nozzle_diameter,
         filament_diameter=1.75,
         filament_label="PLA",
         nozzle_temp=0.0,
         printer_notes="PrusaPATuner -- lateral touch-probe test",
+        printer_model=p.printer_model,
         extra_comment_lines=(
             f"; probe axis={axis}{'+' if sign > 0 else '-'} "
             f"creep={p.creep_mm} mm slow={p.slow_feed_mm_min} mm/min "
@@ -166,10 +174,12 @@ def build_probe_test(params: ProbeParams) -> ProbePlan:
         ),
     )
 
-    # TODO: pass the probe params' nozzle diameter here once ProbeParams
-    # grows one -- 0.4 is hardcoded today because the probe is contact-only
-    # (no extrusion) and the check is advisory.
-    firmware_asserts(lines, nozzle_diameter=0.4)
+    firmware_asserts(
+        lines,
+        nozzle_diameter=p.nozzle_diameter,
+        printer_model=p.printer_model,
+        tool_index=p.tool_index,
+    )
 
     # ---- metrics: stream to host, silence noise, enable what we consume ----
     # loadcell_value = the contact-force signal under test; pos_x/pos_y give
@@ -189,13 +199,35 @@ def build_probe_test(params: ProbeParams) -> ProbePlan:
 
     lines.append("G90 ; absolute XYZ")
 
-    # Optional heat. Default COLD (probe_temp == 0): a cold brass tip won't
-    # mar/melt a plastic target and the loadcell reads fine cold.
-    if p.probe_temp > 0:
+    # Optional heat. A plain CORE One retains the original cold-probe path.
+    # INDX must first pick the requested tool and uses PrusaSlicer's 120 C
+    # Z-home sequence. A nominally cold INDX probe then waits until the
+    # selected nozzle has cooled to 40 C; merely issuing M104 S0 and moving
+    # on would leave a 120 C nozzle hot enough to mar a plastic target.
+    indx = is_indx(p.printer_model)
+    if p.probe_temp > 0 and not indx:
         lines.append(f"M104 S{p.probe_temp:.0f} ; preheat nozzle")
-    lines.append("G28 ; home")
+    home_selected_tool(
+        lines,
+        printer_model=p.printer_model,
+        tool_index=p.tool_index,
+    )
     if p.probe_temp > 0:
-        lines.append(f"M109 S{p.probe_temp:.0f} ; wait for probe temp")
+        if indx:
+            lines.append(
+                f"M104 T{p.tool_index} S{p.probe_temp:.0f} ; set selected INDX probe temp"
+            )
+            lines.append(
+                f"M109 T{p.tool_index} R{p.probe_temp:.0f} ; wait for INDX heat or cooling"
+            )
+        else:
+            lines.append(f"M109 S{p.probe_temp:.0f} ; wait for probe temp")
+    elif indx:
+        lines.append(f"M104 T{p.tool_index} S0 ; cool selected INDX tool after Z home")
+        lines.append(
+            f"M109 T{p.tool_index} R40 ; wait for plastic-safe INDX probe temp"
+        )
+        lines.append(f"M104 T{p.tool_index} S0 ; keep selected INDX nozzle off")
 
     lines.append("G90 ; absolute XYZ (reassert after home)")
 
@@ -257,9 +289,12 @@ def build_probe_test(params: ProbeParams) -> ProbePlan:
     sweep_end_marker(lines, m117_prefix="PROBE", marker_prefix=PROBE_MARKER_PREFIX)
 
     # cleanup
-    if p.probe_temp > 0:
-        lines.append("M104 S0 ; nozzle off")
-    lines.append("M84 ; disable motors")
+    finish_selected_tool(
+        lines,
+        printer_model=p.printer_model,
+        tool_index=p.tool_index,
+        turn_off_nozzle=p.probe_temp > 0 or indx,
+    )
 
     return ProbePlan(
         gcode="\n".join(lines) + "\n",

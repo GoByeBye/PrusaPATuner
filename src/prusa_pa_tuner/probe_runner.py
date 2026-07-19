@@ -19,6 +19,7 @@ from typing import Any, Callable
 import numpy as np
 
 from .config import AppConfig
+from .gcode_preamble import is_indx, normalise_printer_model
 from .probe_analysis import ProbeAnalysis, analyse_probe, probe_analysis_to_dict
 from .probe_gen import ProbeParams, ProbePlan, build_probe_test
 from .netutil import local_ip_toward
@@ -69,6 +70,7 @@ class ProbeRun:
     def to_dict(self) -> dict[str, Any]:
         s = self.state
         p = self.plan.params
+        model = normalise_printer_model(p.printer_model)
         return {
             "state": s.state,
             "message": s.message,
@@ -79,12 +81,18 @@ class ProbeRun:
             "axis": self.plan.axis,
             "dir": "+" if self.plan.dir_sign > 0 else "-",
             "n_touches": p.n_touches,
+            "printer_model": model,
+            "tool_index": p.tool_index if is_indx(model) else None,
             "analysis": probe_analysis_to_dict(s.analysis) if s.analysis else None,
         }
 
 
 def probe_params_from_config(cfg: AppConfig, udp_host: str) -> ProbeParams:
+    printer_model = normalise_printer_model(cfg.printer_model)
     return ProbeParams(
+        nozzle_diameter=cfg.nozzle_diameter,
+        printer_model=printer_model,
+        tool_index=cfg.tool_index,
         probe_axis=cfg.probe_axis,
         probe_dir=cfg.probe_dir,
         start_x=cfg.probe_start_x,
@@ -99,7 +107,11 @@ def probe_params_from_config(cfg: AppConfig, udp_host: str) -> ProbeParams:
         probe_temp=cfg.probe_temp,
         udp_host=udp_host,
         udp_port=cfg.udp_port,
-        label="Touch-probe lateral characterisation",
+        label=(
+            f"Touch-probe lateral characterisation -- T{cfg.tool_index}"
+            if is_indx(printer_model)
+            else "Touch-probe lateral characterisation"
+        ),
     )
 
 
@@ -159,7 +171,10 @@ async def run_probe_test(
             cfg.printer_host, cfg.printer_api_key,
             password=cfg.printer_password, user=cfg.printer_user or "maker",
         ) as pl:
-            filename = f"probe_test_{int(time.time())}.gcode"
+            tool_part = (
+                f"_t{params.tool_index}" if is_indx(params.printer_model) else ""
+            )
+            filename = f"probe_test{tool_part}_{int(time.time())}.gcode"
             await pl.upload_and_print(filename, plan.gcode)
             run.state.state = "running"
             run.state.message = "Job started; capturing loadcell + position…"
@@ -238,8 +253,9 @@ def _dump_probe_run(
 ) -> None:
     """Save the raw arrays + plan scalars to runs/probe_<ts>.npz."""
     try:
-        dump_path = runs_dir() / f"probe_{int(run.state.started_at)}.npz"
         p = run.plan.params
+        tool_part = f"_t{p.tool_index}" if is_indx(p.printer_model) else ""
+        dump_path = runs_dir() / f"probe{tool_part}_{int(run.state.started_at)}.npz"
         np.savez(
             dump_path,
             force_t=force_t,
@@ -264,6 +280,10 @@ def _dump_probe_run(
             backoff_mm=np.array([p.backoff_mm]),
             settle_ms=np.array([p.settle_ms]),
             probe_temp=np.array([p.probe_temp]),
+            printer_model=np.array(
+                [normalise_printer_model(p.printer_model)], dtype="U32"
+            ),
+            tool_index=np.array([p.tool_index if is_indx(p.printer_model) else -1]),
         )
         if run.state.analysis is not None:
             run.state.analysis.notes.append(f"raw data dumped to {dump_path.resolve()}")
@@ -285,6 +305,8 @@ class ProbeRunInfo:
     n_touches: int
     creep_mm: float
     duration_s: float
+    printer_model: str = "COREONE"
+    tool_index: int | None = None
 
 
 def list_probe_runs(runs_dir: str | os.PathLike = "runs") -> list[ProbeRunInfo]:
@@ -305,6 +327,12 @@ def list_probe_runs(runs_dir: str | os.PathLike = "runs") -> list[ProbeRunInfo]:
                     except Exception:
                         axis = "X"
                 sign = _s("dir_sign", 1.0)
+                model = (
+                    str(d["printer_model"][0])
+                    if "printer_model" in d
+                    else "COREONE"
+                )
+                raw_tool = int(_s("tool_index", -1))
                 out.append(
                     ProbeRunInfo(
                         filename=f.name,
@@ -316,6 +344,12 @@ def list_probe_runs(runs_dir: str | os.PathLike = "runs") -> list[ProbeRunInfo]:
                         n_touches=int(_s("n_touches", 0)),
                         creep_mm=_s("creep_mm", 0.0),
                         duration_s=float(ft[-1] - ft[0]) if len(ft) >= 2 else 0.0,
+                        printer_model=model,
+                        tool_index=(
+                            raw_tool
+                            if is_indx(model) and 0 <= raw_tool <= 7
+                            else None
+                        ),
                     )
                 )
         except Exception:
@@ -336,7 +370,13 @@ def load_probe_run(path: str | os.PathLike) -> tuple[ProbePlan, dict[str, Any]]:
         except Exception:
             axis = "X"
     sign = _s("dir_sign", 1.0)
+    printer_model = (
+        str(d["printer_model"][0]) if "printer_model" in d else "COREONE"
+    )
+    raw_tool = int(_s("tool_index", 0))
     params = ProbeParams(
+        printer_model=printer_model,
+        tool_index=raw_tool if is_indx(printer_model) else 0,
         probe_axis=axis,
         probe_dir="+" if sign > 0 else "-",
         start_x=_s("start_x", 125.0),

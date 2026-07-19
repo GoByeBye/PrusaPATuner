@@ -1,6 +1,11 @@
 """Tests for the Live Map module: gcode parse, time-model, preamble, mapping."""
+import httpx
 import numpy as np
+import pytest
 
+import prusa_pa_tuner.app as app_module
+import prusa_pa_tuner.livemap_runner as livemap_runner
+from prusa_pa_tuner.config import AppConfig
 from prusa_pa_tuner.gcode_parse import (
     layer_polylines,
     layer_zs,
@@ -8,8 +13,13 @@ from prusa_pa_tuner.gcode_parse import (
 )
 from prusa_pa_tuner.livemap_gen import build_livemap_gcode
 from prusa_pa_tuner.livemap_map import _layers_from_pos_z, layer_detail, map_run
-from prusa_pa_tuner.livemap_runner import LiveMapRun, _dump_livemap_run, replay_livemap
-
+from prusa_pa_tuner.livemap_runner import (
+    LiveMapRun,
+    _dump_livemap_run,
+    _nearest_layer_index,
+    replay_livemap,
+)
+from prusa_pa_tuner.prusalink import JobStatus
 
 # A small two-layer square with a perimeter + infill feature on each layer.
 # Relative-E (M83), which is the PrusaSlicer-for-Prusa default.
@@ -89,6 +99,158 @@ G1 X10 Y10 E0.5
     pg = parse_gcode(g)
     assert len(pg.layers) == 2
     assert layer_zs(pg) == [0.2, 0.4]
+
+
+def test_prusaslicer_ij_arcs_are_tessellated_without_inflating_command_count():
+    """PrusaSlicer ``emit_center`` arcs must become curved map geometry.
+
+    The slicer uses absolute XY endpoints, relative I/J centre offsets and
+    relative E.  The second arc is helical, matching the handful of G2+Z
+    commands in the user's real COREONEINDX slice.
+    """
+    g = """G90
+M83
+G92 X10 Y0 Z0.2
+;LAYER_CHANGE
+;Z:0.2
+;TYPE:External perimeter
+G3 X0 Y10 I-10 J0 E1 F600
+;LAYER_CHANGE
+;Z:0.4
+G2 X10 Y0 Z0.4 I0 J-10 E1 F600
+"""
+    pg = parse_gcode(g)
+
+    assert layer_zs(pg) == [0.2, 0.4]
+    assert pg.n_extruding == 2  # source commands, not tessellated chords
+    assert len(pg.moves) > 2
+    assert all(m.extruding for m in pg.moves)
+    assert {m.layer for m in pg.moves} == {0, 1}
+
+    for li in (0, 1):
+        moves = [m for m in pg.moves if m.layer == li]
+        assert np.isclose(sum(m.length_mm for m in moves), 0.5 * np.pi * 10.0)
+        assert all(
+            b.t_start >= a.t_start
+            for a, b in zip(moves, moves[1:], strict=False)
+        )
+
+    # Exact endpoints survive slicer coordinate rounding; intermediate points
+    # trace the quadrant and the helical arc interpolates Z monotonically.
+    assert (pg.moves[0].x0, pg.moves[0].y0) == (10.0, 0.0)
+    assert np.isclose(pg.moves[-1].x1, 10.0)
+    assert np.isclose(pg.moves[-1].y1, 0.0)
+    layer1_z = [m.z1 for m in pg.moves if m.layer == 1]
+    assert np.all(np.diff(layer1_z) >= 0.0)
+    assert np.isclose(layer1_z[-1], 0.4)
+    assert np.allclose(pg.bbox, (0.0, 10.0, 0.0, 10.0), atol=1e-9)
+
+
+async def test_printer_z_endpoint_tags_sample_with_active_livemap_run(monkeypatch):
+    class _FakePrinter:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def status(self):
+            return {"printer": {"axis_z": 6.2, "state": "PRINTING"}}
+
+    cfg = AppConfig(printer_host="printer", printer_api_key="test-key")
+    run = LiveMapRun(cfg, "midprint.gcode", SAMPLE, parse_gcode(SAMPLE))
+    run.state.started_at = 123.5
+    monkeypatch.setattr(app_module.state, "cfg", cfg)
+    monkeypatch.setattr(app_module.state, "livemap_run", run)
+    monkeypatch.setattr(app_module, "PrusaLinkClient", _FakePrinter)
+
+    payload = await app_module.get_livemap_printer_z()
+
+    assert payload == {
+        "axis_z": 6.2,
+        "state": "PRINTING",
+        "online": True,
+        "stale_sec": 0,
+        "run_started_at": 123.5,
+    }
+
+
+def test_arc_wipe_updates_position_but_is_not_extrusion():
+    """Negative-E G2/G3 WIPE moves are geometry, not printed polylines."""
+    g = """G90
+M83
+G92 X10 Y0 Z0.2
+;LAYER_CHANGE
+;Z:0.2
+;TYPE:External perimeter
+G3 X0 Y10 I-10 J0 E1 F600
+;WIPE_START
+G2 X10 Y0 I0 J-10 E-0.2 F6000
+;WIPE_END
+G1 X11 Y0 E0.1 F1200
+"""
+    pg = parse_gcode(g)
+    wipe = [m for m in pg.moves if m.e < 0]
+
+    assert len(wipe) > 1
+    assert not any(m.extruding for m in wipe)
+    assert pg.n_extruding == 2
+    # The command after the wipe must start at the arc endpoint.  Ignoring G2
+    # used to leave parser XYZ stale and corrupt every following segment.
+    last = pg.moves[-1]
+    assert np.isclose(last.x0, 10.0)
+    assert np.isclose(last.y0, 0.0)
+    assert np.isclose(last.x1, 11.0)
+    assert np.isclose(last.y1, 0.0)
+
+
+def test_extruding_arc_can_open_a_layer():
+    """A layer whose first extrusion is G3 opens at that marker, not later."""
+    g = """G90
+M83
+G92 X1 Y0 Z0.2
+;LAYER_CHANGE
+;Z:0.2
+G3 X0 Y1 I-1 J0 E0.1
+;LAYER_CHANGE
+;Z:0.4
+G1 Z0.4
+G3 X-1 Y0 I0 J-1 E0.1
+G1 X-2 Y0 E0.1
+"""
+    pg = parse_gcode(g)
+
+    assert layer_zs(pg) == [0.2, 0.4]
+    assert pg.layers[0].move_lo == 0
+    assert all(m.layer == 0 for m in pg.moves[:pg.layers[0].move_hi])
+    second = pg.moves[pg.layers[1].move_lo:pg.layers[1].move_hi]
+    assert second
+    assert all(m.layer == 1 for m in second)
+
+
+def test_non_xy_arc_falls_back_to_one_endpoint_chord_and_keeps_state():
+    """G18/G19 are outside the scoped XY tessellator, but must advance XYZ."""
+    g = """G90
+M83
+G18
+G92 X0 Y0 Z0
+;LAYER_CHANGE
+;Z:10
+G2 X10 Z10 I5 K5 E1 F600
+G17
+G1 X11 Y0 E0.1 F1200
+"""
+    pg = parse_gcode(g)
+
+    # Interpreting this XZ arc as XY would generate many semicircle chords.
+    assert len(pg.moves) == 2
+    arc_chord, following = pg.moves
+    assert (arc_chord.x1, arc_chord.y1, arc_chord.z1) == (10.0, 0.0, 10.0)
+    assert (following.x0, following.y0, following.z0) == (10.0, 0.0, 10.0)
+    assert (following.x1, following.y1, following.z1) == (11.0, 0.0, 10.0)
 
 
 def test_layer_polylines_grouped_by_feature():
@@ -247,6 +409,38 @@ def test_map_run_layers_from_noisy_pos_z():
         assert np.count_nonzero(m.s_layer == li) > 0
 
 
+def test_pos_z_refinement_preserves_mid_print_layer_seed():
+    """A capture attached on layer 3 must never synthesize layers 1 or 2."""
+    n = 1200
+    wt = np.linspace(0.0, 12.0, n)
+    true_b = 600
+    # Coarse arc length is deliberately late, but already uses absolute parsed
+    # layer indices from the attach seed.
+    wlayer = np.full(n, 2, dtype=int)
+    wlayer[700:] = 3
+    pz = np.where(np.arange(n) < true_b, 0.6, 0.8) + 0.1
+    pz[np.arange(n) % 5 == 0] = 168.0
+    trav = np.zeros(n, dtype=bool)
+    trav[true_b - 4:true_b + 4] = True
+
+    out, diag = _layers_from_pos_z(
+        wt,
+        wlayer,
+        wt,
+        pz,
+        [0.2, 0.4, 0.6, 0.8],
+        trav,
+        start_layer_index=2,
+    )
+
+    assert out is not None
+    assert set(np.unique(out)) == {2, 3}
+    assert diag["start_layer_index"] == 2
+    assert [b["into_layer"] for b in diag["boundaries"]] == [3]
+    assert abs(int(np.searchsorted(out, 3)) - (true_b + 4)) <= 30
+    assert abs(diag["offset"] - 0.1) < 0.03
+
+
 # One layer, two long parallel infill lines joined by a U-turn -- the shape
 # where a force-stream hole used to draw a false connector across the lines.
 TURN_GCODE = """G90
@@ -312,3 +506,309 @@ def test_npz_roundtrip_replay(tmp_path, monkeypatch):
     assert len(mapped.parsed.layers) == 2
     assert "External perimeter" in mapped.feature_stats
     assert mapped.s_force.size > mapped.parsed.n_extruding
+    assert mapped.cross["start_layer_index"] == 0
+    assert mapped.cross["attach_axis_z"] is None
+
+
+def test_attached_npz_replay_starts_at_saved_layer(tmp_path, monkeypatch):
+    """Saved mid-print captures seed coarse mapping from their attach layer."""
+    monkeypatch.chdir(tmp_path)
+    pg = parse_gcode(SAMPLE)
+    t, x, y, z, force = _synthesize_streams(pg)
+    layer_one_t = 2.0 + min(
+        move.t_start for move in pg.moves if move.extruding and move.layer == 1
+    )
+    keep = t >= layer_one_t
+
+    run = LiveMapRun(
+        cfg=None,
+        name="mid-print.gcode",
+        user_gcode=SAMPLE,
+        parsed=pg,
+        attached_existing=True,
+        attach_axis_z=0.4,
+        attach_layer_index=1,
+    )
+    run.state.started_at = 1700000001.0
+    run.force_t = list(t[keep]); run.force_y = list(force[keep])
+    run.pos_x_t = list(t[keep]); run.pos_x = list(x[keep])
+    run.pos_y_t = list(t[keep]); run.pos_y = list(y[keep])
+    # Leave pos_z empty to exercise the seeded coarse arc-length fallback.
+
+    fname = _dump_livemap_run(run)
+    assert fname
+    path = tmp_path / "runs" / fname
+    with np.load(path) as data:
+        assert bool(data["attached_existing"][0]) is True
+        assert float(data["attach_axis_z"][0]) == 0.4
+        assert int(data["attach_layer_index"][0]) == 1
+
+    mapped = replay_livemap(path)
+    assert mapped.s_layer.size > 0
+    assert set(np.unique(mapped.s_layer)) == {1}
+    assert mapped.cross["layer_source"] == "arc_length"
+    assert mapped.cross["start_layer_index"] == 1
+    assert mapped.cross["attach_axis_z"] == 0.4
+
+
+class _FakePrusaLink:
+    """Minimal async PrusaLink double for Live Map lifecycle tests."""
+
+    statuses: list = []
+    upload_error: Exception | None = None
+    printer_status: dict = {"printer": {"axis_z": 0.4}}
+    instances: list["_FakePrusaLink"] = []
+
+    def __init__(self, *args, **kwargs):
+        self.statuses = list(type(self).statuses)
+        self.upload_calls: list[tuple[str, str | bytes]] = []
+        self.status_calls = 0
+        type(self).instances.append(self)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return None
+
+    async def upload_and_print(self, filename, gcode):
+        self.upload_calls.append((filename, gcode))
+        if type(self).upload_error is not None:
+            raise type(self).upload_error
+        return {"ok": True}
+
+    async def get_job_status(self):
+        self.status_calls += 1
+        if self.statuses:
+            result = self.statuses.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            if callable(result):
+                return result(self)
+            return result
+        return JobStatus("FINISHED", 100.0, 0, {})
+
+    async def status(self):
+        return type(self).printer_status
+
+
+async def _fake_livemap_collect(
+    stream, metric, stop_event, extractor, out_t, out_v, **kwargs,
+):
+    """Populate every requested stream, then remain alive until cleanup."""
+    values = {
+        "loadcell_value": [100.0, 101.0, 102.0],
+        "pos_x": [10.0, 11.0, 12.0],
+        "pos_y": [10.0, 10.0, 10.0],
+        "pos_z": [0.2, 0.2, 0.2],
+    }
+    out_t.extend([1.0, 2.0, 3.0])
+    out_v.extend(values[metric])
+    await stop_event.wait()
+
+
+def _printing(progress=12.0):
+    return JobStatus("PRINTING", progress, 60, {"id": 42})
+
+
+def _finished():
+    return JobStatus("FINISHED", 100.0, 0, {"id": 42})
+
+
+def _matching_uploaded_job(progress=12.0):
+    """Build an active job whose display name is the fake's one PUT target."""
+    def factory(client):
+        assert len(client.upload_calls) == 1
+        filename = client.upload_calls[0][0]
+        return JobStatus(
+            "PRINTING",
+            progress,
+            60,
+            {
+                "id": 42,
+                "file": {
+                    # Buddy exposes an 8.3 alias in `name`; reconciliation
+                    # must use the exact long `display_name` when available.
+                    "name": "LIVEMA~1.GCO",
+                    "display_name": filename,
+                },
+            },
+        )
+
+    return factory
+
+
+def _unrelated_job(progress=12.0):
+    return JobStatus(
+        "PRINTING",
+        progress,
+        60,
+        {
+            "id": 99,
+            "file": {
+                "name": "OTHER~1.GCO",
+                "display_name": "somebody-elses-print.gcode",
+            },
+        },
+    )
+
+
+def test_nearest_layer_index_uses_finite_printer_z():
+    parsed = parse_gcode(SAMPLE)
+    assert _nearest_layer_index(parsed, 0.19) == 0
+    assert _nearest_layer_index(parsed, 0.39) == 1
+    assert _nearest_layer_index(parsed, float("nan")) is None
+    assert _nearest_layer_index(parsed, 56.7) is None
+
+
+async def test_attach_existing_collects_and_saves_without_upload(tmp_path, monkeypatch):
+    """Attach mode follows the active job and never mutates printer storage."""
+    monkeypatch.chdir(tmp_path)
+    _FakePrusaLink.instances.clear()
+    _FakePrusaLink.statuses = [_printing(17.0), _printing(18.0), _finished()]
+    _FakePrusaLink.upload_error = None
+    monkeypatch.setattr(livemap_runner, "PrusaLinkClient", _FakePrusaLink)
+    monkeypatch.setattr(livemap_runner, "collect_metric", _fake_livemap_collect)
+    monkeypatch.setattr(livemap_runner, "local_ip_toward", lambda *a, **k: "127.0.0.1")
+
+    def must_not_build(*args, **kwargs):
+        raise AssertionError("attach_existing must not build upload gcode")
+
+    monkeypatch.setattr(livemap_runner, "build_livemap_gcode", must_not_build)
+
+    parsed = parse_gcode(SAMPLE)
+    cfg = AppConfig(printer_host="printer", printer_api_key="test-key")
+    stream = object()
+    run = await livemap_runner.run_live_map(
+        cfg,
+        stream,
+        SAMPLE,
+        parsed,
+        "already-printing.gcode",
+        attach_existing=True,
+        poll_interval_s=0.0,
+        job_timeout_s=10.0,
+    )
+
+    client = _FakePrusaLink.instances[-1]
+    assert client.upload_calls == []
+    assert client.status_calls >= 3  # attach validation + active-job polling
+    assert run.attached_existing is True
+    assert run.attach_axis_z == 0.4
+    assert run.attach_layer_index == 1
+    assert run.to_dict()["attach_layer_index"] == 1
+    assert run.state.state == "done"
+    assert run.state.saved_filename
+    assert run.force_y == [100.0, 101.0, 102.0]
+    assert run.pos_x == [10.0, 11.0, 12.0]
+
+    saved = tmp_path / "runs" / run.state.saved_filename
+    assert saved.exists()
+    with np.load(saved) as data:
+        assert np.array_equal(data["force_y"], np.array(run.force_y))
+        assert np.array_equal(data["pos_x"], np.array(run.pos_x))
+        assert np.array_equal(data["pos_y"], np.array(run.pos_y))
+        assert np.array_equal(data["pos_z"], np.array(run.pos_z))
+
+
+async def _run_upload_reconciliation_case(
+    tmp_path,
+    monkeypatch,
+    *,
+    upload_error,
+    statuses,
+):
+    """Run one instant fake upload/reconciliation lifecycle."""
+    monkeypatch.chdir(tmp_path)
+    _FakePrusaLink.instances.clear()
+    _FakePrusaLink.statuses = list(statuses)
+    _FakePrusaLink.upload_error = upload_error
+    monkeypatch.setattr(livemap_runner, "PrusaLinkClient", _FakePrusaLink)
+    monkeypatch.setattr(livemap_runner, "collect_metric", _fake_livemap_collect)
+    monkeypatch.setattr(livemap_runner, "local_ip_toward", lambda *a, **k: "127.0.0.1")
+
+    async def no_sleep(*args, **kwargs):
+        return None
+
+    # Reconciliation deliberately polls through delayed /job visibility. Keep
+    # that grace loop and the subsequent job lifecycle instantaneous here.
+    monkeypatch.setattr(livemap_runner.asyncio, "sleep", no_sleep)
+
+    parsed = parse_gcode(SAMPLE)
+    cfg = AppConfig(printer_host="printer", printer_api_key="test-key")
+    run = await livemap_runner.run_live_map(
+        cfg,
+        object(),
+        SAMPLE,
+        parsed,
+        "timeout.gcode",
+        poll_interval_s=0.0,
+        job_timeout_s=10.0,
+    )
+
+    client = _FakePrusaLink.instances[-1]
+    return run, client
+
+
+async def test_upload_success_waits_for_matching_job_after_initial_none(
+    tmp_path, monkeypatch,
+):
+    """A 201 response still waits for /job to expose the exact started file."""
+    run, client = await _run_upload_reconciliation_case(
+        tmp_path,
+        monkeypatch,
+        upload_error=None,
+        statuses=[None, _matching_uploaded_job(9.0), _finished()],
+    )
+
+    assert len(client.upload_calls) == 1
+    assert client.status_calls >= 3
+    assert run.state.state == "done"
+    assert run.state.saved_filename
+
+
+@pytest.mark.parametrize("timeout_type", [httpx.ReadTimeout, httpx.WriteTimeout])
+async def test_upload_transport_timeout_reconciles_without_retry(
+    tmp_path, monkeypatch, timeout_type,
+):
+    """An ambiguous PUT is reconciled through 204 and transient status loss."""
+    put = httpx.Request("PUT", "http://printer/api/v1/files/usb/test.gcode")
+    status_timeout = httpx.ReadTimeout(
+        "job status temporarily unavailable",
+        request=httpx.Request("GET", "http://printer/api/v1/job"),
+    )
+    run, client = await _run_upload_reconciliation_case(
+        tmp_path,
+        monkeypatch,
+        upload_error=timeout_type("upload outcome unknown", request=put),
+        statuses=[None, status_timeout, _matching_uploaded_job(10.0), _finished()],
+    )
+
+    # Print-After-Upload is not safe to repeat after an ambiguous transport
+    # failure. Recovery is read-only and must issue exactly one PUT.
+    assert len(client.upload_calls) == 1
+    assert client.status_calls >= 4
+    assert run.state.state == "done"
+    assert run.state.saved_filename
+
+
+async def test_upload_timeout_rejects_unrelated_active_job_without_retry(
+    tmp_path, monkeypatch,
+):
+    """Never mistake somebody else's active print for the timed-out PUT."""
+    run, client = await _run_upload_reconciliation_case(
+        tmp_path,
+        monkeypatch,
+        upload_error=httpx.ReadTimeout(
+            "upload outcome unknown",
+            request=httpx.Request(
+                "PUT", "http://printer/api/v1/files/usb/test.gcode",
+            ),
+        ),
+        statuses=[_unrelated_job()],
+    )
+
+    assert len(client.upload_calls) == 1
+    assert run.state.state == "error"
+    assert run.state.saved_filename is None
+    assert "somebody-elses-print.gcode" in (run.state.error or "")

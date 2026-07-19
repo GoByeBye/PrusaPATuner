@@ -21,6 +21,7 @@ import numpy as np
 from .config import AppConfig
 from .flow_analysis import FlowAnalysis, analyse_flow, flow_analysis_to_dict
 from .flow_gen import FlowPlan, FlowRampParams, build_flow_ramp
+from .gcode_preamble import is_indx, normalise_printer_model
 from .netutil import local_ip_toward
 from .prusalink import PrusaLinkClient
 from .run_lifecycle import (
@@ -65,6 +66,8 @@ class FlowRun:
 
     def to_dict(self) -> dict[str, Any]:
         s = self.state
+        p = self.plan.params
+        model = normalise_printer_model(p.printer_model)
         return {
             "state": s.state,
             "message": s.message,
@@ -74,17 +77,22 @@ class FlowRun:
             "n_force_samples": len(self.force_t),
             "n_levels": len(self.plan.segments),
             "flow_levels": [seg.flow_mm3_s for seg in self.plan.segments],
+            "printer_model": model,
+            "tool_index": p.tool_index if is_indx(model) else None,
             "analysis": flow_analysis_to_dict(s.analysis) if s.analysis else None,
         }
 
 
 def flow_params_from_config(cfg: AppConfig, udp_host: str) -> FlowRampParams:
+    printer_model = normalise_printer_model(cfg.printer_model)
     return FlowRampParams(
         nozzle_temp=cfg.nozzle_temp,
         preheat_temp=cfg.preheat_temp,
         nozzle_diameter=cfg.nozzle_diameter,
         filament_diameter=cfg.filament_diameter,
         filament_label=cfg.filament_label,
+        printer_model=printer_model,
+        tool_index=cfg.tool_index,
         min_flow_mm3_s=cfg.flow_min_mm3_s,
         max_flow_mm3_s=cfg.flow_max_mm3_s,
         flow_step_mm3_s=cfg.flow_step_mm3_s,
@@ -98,7 +106,11 @@ def flow_params_from_config(cfg: AppConfig, udp_host: str) -> FlowRampParams:
         purge_z=cfg.purge_z,
         udp_host=udp_host,
         udp_port=cfg.udp_port,
-        label=f"Max flow test -- {cfg.filament_label}",
+        label=(
+            f"Max flow test -- {cfg.filament_label} -- T{cfg.tool_index}"
+            if is_indx(printer_model)
+            else f"Max flow test -- {cfg.filament_label}"
+        ),
     )
 
 
@@ -153,7 +165,10 @@ async def run_flow_test(
             password=cfg.printer_password,
             user=cfg.printer_user or "maker",
         ) as pl:
-            filename = f"flow_test_{int(time.time())}.gcode"
+            tool_part = (
+                f"_t{params.tool_index}" if is_indx(params.printer_model) else ""
+            )
+            filename = f"flow_test{tool_part}_{int(time.time())}.gcode"
             await pl.upload_and_print(filename, plan.gcode)
             run.state.state = "running"
             run.state.message = "Job started; capturing loadcell stream…"
@@ -234,8 +249,9 @@ def _dump_flow_run(
 ) -> None:
     """Save the raw arrays + plan scalars to runs/flow_<ts>.npz."""
     try:
-        dump_path = runs_dir() / f"flow_{int(run.state.started_at)}.npz"
         p = run.plan.params
+        tool_part = f"_t{p.tool_index}" if is_indx(p.printer_model) else ""
+        dump_path = runs_dir() / f"flow{tool_part}_{int(run.state.started_at)}.npz"
         np.savez(
             dump_path,
             force_t=force_t,
@@ -261,6 +277,10 @@ def _dump_flow_run(
             filament_diameter=np.array([p.filament_diameter]),
             nozzle_temp=np.array([p.nozzle_temp]),
             filament_label=np.array([p.filament_label], dtype="U128"),
+            printer_model=np.array(
+                [normalise_printer_model(p.printer_model)], dtype="U32"
+            ),
+            tool_index=np.array([p.tool_index if is_indx(p.printer_model) else -1]),
         )
         if run.state.analysis is not None:
             run.state.analysis.notes.append(
@@ -286,6 +306,8 @@ class FlowRunInfo:
     duration_s: float
     filament_label: str = ""
     nozzle_temp: float = 0.0
+    printer_model: str = "COREONE"
+    tool_index: int | None = None
 
 
 def list_flow_runs(runs_dir: str | os.PathLike = "runs") -> list[FlowRunInfo]:
@@ -306,6 +328,12 @@ def list_flow_runs(runs_dir: str | os.PathLike = "runs") -> list[FlowRunInfo]:
                         label = str(d["filament_label"][0])
                     except Exception:
                         label = ""
+                model = (
+                    str(d["printer_model"][0])
+                    if "printer_model" in d
+                    else "COREONE"
+                )
+                raw_tool = int(_s("tool_index", -1))
                 out.append(
                     FlowRunInfo(
                         filename=f.name,
@@ -319,6 +347,12 @@ def list_flow_runs(runs_dir: str | os.PathLike = "runs") -> list[FlowRunInfo]:
                         duration_s=float(ft[-1] - ft[0]) if len(ft) >= 2 else 0.0,
                         filament_label=label,
                         nozzle_temp=_s("nozzle_temp", 0.0),
+                        printer_model=model,
+                        tool_index=(
+                            raw_tool
+                            if is_indx(model) and 0 <= raw_tool <= 7
+                            else None
+                        ),
                     )
                 )
         except Exception:
@@ -332,7 +366,13 @@ def load_flow_run(path: str | os.PathLike) -> tuple[FlowPlan, dict[str, Any]]:
     d = np.load(path, allow_pickle=True)
     _s = partial(npz_scalar, d)
 
+    printer_model = (
+        str(d["printer_model"][0]) if "printer_model" in d else "COREONE"
+    )
+    raw_tool = int(_s("tool_index", 0))
     params = FlowRampParams(
+        printer_model=printer_model,
+        tool_index=raw_tool if is_indx(printer_model) else 0,
         nozzle_temp=_s("nozzle_temp", 215.0),
         filament_diameter=_s("filament_diameter", 1.75),
         min_flow_mm3_s=_s("min_flow_mm3_s", 5.0),

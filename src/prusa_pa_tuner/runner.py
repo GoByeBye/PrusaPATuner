@@ -12,6 +12,7 @@ import numpy as np
 from .analysis import SweepAnalysis, analyse_sweep
 from .config import AppConfig
 from .gcode_gen import SweepParams, SweepPlan, build_sweep
+from .gcode_preamble import is_indx, normalise_printer_model
 from .netutil import local_ip_toward
 from .prusalink import PrusaLinkClient
 from .run_lifecycle import (
@@ -79,6 +80,8 @@ class TuningRun:
 
     def to_dict(self) -> dict[str, Any]:
         s = self.state
+        p = self.plan.params
+        model = normalise_printer_model(p.printer_model)
         return {
             "state": s.state,
             "message": s.message,
@@ -89,6 +92,8 @@ class TuningRun:
             "n_force_samples": len(self.force_t),
             "n_k": len(self.plan.segments),
             "k_values": [seg.k for seg in self.plan.segments],
+            "printer_model": model,
+            "tool_index": p.tool_index if is_indx(model) else None,
             "analysis": _analysis_to_dict(s.analysis) if s.analysis else None,
         }
 
@@ -332,6 +337,7 @@ def _volumetric_to_time_domain(
 
 
 def params_from_config(cfg: AppConfig, udp_host: str) -> SweepParams:
+    printer_model = normalise_printer_model(cfg.printer_model)
     slow_feed_mm_s, slow_half_s = _volumetric_to_time_domain(
         cfg.slow_flow_mm3_s, cfg.slow_volume_mm3, cfg.filament_diameter,
     )
@@ -344,6 +350,8 @@ def params_from_config(cfg: AppConfig, udp_host: str) -> SweepParams:
         nozzle_diameter=cfg.nozzle_diameter,
         filament_diameter=cfg.filament_diameter,
         filament_label=cfg.filament_label,
+        printer_model=printer_model,
+        tool_index=cfg.tool_index,
         slow_feed_mm_s=slow_feed_mm_s,
         fast_feed_mm_s=fast_feed_mm_s,
         slow_half_s=slow_half_s,
@@ -360,7 +368,11 @@ def params_from_config(cfg: AppConfig, udp_host: str) -> SweepParams:
         first_slow_leg_factor=cfg.first_slow_leg_factor,
         udp_host=udp_host,
         udp_port=cfg.udp_port,
-        label=f"PA tuning -- {cfg.filament_label}",
+        label=(
+            f"PA tuning -- {cfg.filament_label} -- T{cfg.tool_index}"
+            if is_indx(printer_model)
+            else f"PA tuning -- {cfg.filament_label}"
+        ),
     )
 
 
@@ -413,9 +425,10 @@ async def run_tuning(
     run = TuningRun(cfg=cfg, plan=plan, on_update=on_update)
     run.state.started_at = time.time()
     run.state.state = "preparing"
+    tool_label = f", T{params.tool_index}" if is_indx(params.printer_model) else ""
     run.state.message = (
         f"Generated sweep ({len(plan.segments)} K values, "
-        f"timeout {job_timeout_s/60:.0f} min), uploading…"
+        f"timeout {job_timeout_s/60:.0f} min{tool_label}), uploading…"
     )
     run.emit()
 
@@ -453,7 +466,10 @@ async def run_tuning(
             user=cfg.printer_user or "maker",
         ) as pl:
             # upload + auto-print
-            filename = f"pa_tuner_{int(time.time())}.gcode"
+            tool_part = (
+                f"_t{params.tool_index}" if is_indx(params.printer_model) else ""
+            )
+            filename = f"pa_tuner{tool_part}_{int(time.time())}.gcode"
             await pl.upload_and_print(filename, plan.gcode)
             run.state.state = "running"
             run.state.message = "Job started; capturing loadcell stream…"
@@ -525,7 +541,12 @@ async def run_tuning(
         # carries all the timestamped streams. The path is appended to
         # the analyser notes so it surfaces in the UI / on the API.
         try:
-            dump_path = runs_dir() / f"run_{int(run.state.started_at)}.npz"
+            tool_part = (
+                f"_t{plan.params.tool_index}"
+                if is_indx(plan.params.printer_model)
+                else ""
+            )
+            dump_path = runs_dir() / f"run{tool_part}_{int(run.state.started_at)}.npz"
             # Deterministic packet-loss log from msg= sequence gaps
             # (see MetricStream.loss_events). Empty arrays when the
             # stream never saw syslog-wrapped packets.
@@ -600,6 +621,12 @@ async def run_tuning(
                     [plan.params.filament_label], dtype="U128"
                 ),
                 nozzle_temp=np.array([plan.params.nozzle_temp]),
+                printer_model=np.array(
+                    [normalise_printer_model(plan.params.printer_model)], dtype="U32"
+                ),
+                tool_index=np.array(
+                    [plan.params.tool_index if is_indx(plan.params.printer_model) else -1]
+                ),
             )
             analysis.notes.append(
                 f"raw data dumped to {dump_path.resolve()} "

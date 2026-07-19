@@ -42,6 +42,7 @@ from .gcode_preamble import (
     METRICS_TO_SILENCE,
     PA_MARKER_PREFIX,
     baseline_dwell,
+    finish_selected_tool,
     firmware_asserts,
     heat_home_setup,
     metric_setup,
@@ -63,6 +64,8 @@ class SweepParams:
     nozzle_diameter: float = 0.4
     filament_diameter: float = 1.75
     filament_label: str = "PLA"
+    printer_model: str = "COREONE"
+    tool_index: int = 0
 
     # extrusion velocities in mm/s of filament feed (Snapmaker U1 defaults)
     slow_feed_mm_s: float = 0.8
@@ -255,6 +258,7 @@ def build_sweep(params: SweepParams) -> SweepPlan:
         filament_label=p.filament_label,
         nozzle_temp=p.nozzle_temp,
         printer_notes="PrusaPATuner -- free-air PA calibration",
+        printer_model=p.printer_model,
         extra_comment_lines=(f"; K_values = {list(p.K_values)}",),
     )
 
@@ -262,6 +266,8 @@ def build_sweep(params: SweepParams) -> SweepPlan:
     firmware_asserts(
         lines,
         nozzle_diameter=p.nozzle_diameter,
+        printer_model=p.printer_model,
+        tool_index=p.tool_index,
         input_shaper_comment=(
             'FW feature check (kills "not sliced for input shaping" prompt)'
         ),
@@ -307,6 +313,8 @@ def build_sweep(params: SweepParams) -> SweepPlan:
         purge_x=p.purge_x,
         purge_y=p.purge_y,
         purge_z=p.purge_z,
+        printer_model=p.printer_model,
+        tool_index=p.tool_index,
     )
 
     # Running E target. Starts at 0 (just G92'd). Every G1 E below uses an
@@ -539,7 +547,10 @@ def build_sweep(params: SweepParams) -> SweepPlan:
     # M334 with no args is a no-op on current firmware per metrics.md.
     lines.append("M572 S0 ; reset pressure advance")
     lines.append("M591 R ; restore stuck detection (matches PrusaSlicer's pattern)")
-    lines.append("M104 S0 ; nozzle off")
-    lines.append("M84 ; disable motors")
+    finish_selected_tool(
+        lines,
+        printer_model=p.printer_model,
+        tool_index=p.tool_index,
+    )
 
     return SweepPlan(gcode="\n".join(lines) + "\n", segments=segments, params=p)

@@ -8,7 +8,7 @@ import time
 from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
-from typing import Any, Coroutine
+from typing import Any, Coroutine, Literal
 
 from fastapi import (
     FastAPI,
@@ -36,6 +36,7 @@ from .flow_runner import (
     run_flow_test,
 )
 from .gcode_gen import build_sweep
+from .gcode_preamble import is_indx, normalise_printer_model, validated_tool_index
 from .gcode_parse import ParsedGcode, layer_polylines, parse_gcode
 from .livemap_map import MappedRun, layer_detail, mapped_summary
 from .livemap_runner import (
@@ -61,6 +62,7 @@ from .probe_runner import (
     replay_probe,
     run_probe_test,
 )
+from .prusalink import PrusaLinkClient
 from .replay import annotate_run, list_runs, read_annotation, replay
 from .runner import TuningRun, _analysis_to_dict, params_from_config, run_tuning
 from .udp_metrics import MetricStream
@@ -134,6 +136,8 @@ class ConfigModel(BaseModel):
     printer_api_key: str = ""
     printer_user: str = "maker"
     printer_password: str = ""
+    printer_model: Literal["COREONE", "COREONEINDX"] = "COREONE"
+    tool_index: int = Field(0, ge=0, le=7, strict=True)
     udp_port: int = 8514
     nozzle_temp: float = 215.0
     preheat_temp: float = 225.0
@@ -182,7 +186,9 @@ class ConfigModel(BaseModel):
 
     @classmethod
     def from_appconfig(cls, c: AppConfig) -> "ConfigModel":
-        return cls(**{f: getattr(c, f) for f in cls.model_fields if hasattr(c, f)})
+        values = {f: getattr(c, f) for f in cls.model_fields if hasattr(c, f)}
+        values["printer_model"] = normalise_printer_model(c.printer_model)
+        return cls(**values)
 
     def apply(self, c: AppConfig) -> AppConfig:
         for f in self.model_fields:
@@ -307,6 +313,11 @@ def _require_printer_config() -> None:
         raise HTTPException(
             400, "either printer_api_key or printer_password must be configured"
         )
+    try:
+        model = normalise_printer_model(state.cfg.printer_model)
+        validated_tool_index(model, state.cfg.tool_index)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 def _start_run(
@@ -372,6 +383,8 @@ async def get_runs():
                 "duration_s": r.duration_s,
                 "filament_label": r.filament_label,
                 "nozzle_temp": r.nozzle_temp,
+                "printer_model": r.printer_model,
+                "tool_index": r.tool_index,
                 "user_k_opt": r.user_k_opt,
                 "user_k_opt_notes": r.user_k_opt_notes,
             }
@@ -414,6 +427,10 @@ async def post_run_analyse(filename: str):
     return {
         "filename": filename,
         "k_values": [seg.k for seg in plan.segments],
+        "printer_model": normalise_printer_model(plan.params.printer_model),
+        "tool_index": (
+            plan.params.tool_index if is_indx(plan.params.printer_model) else None
+        ),
         "analysis": _analysis_to_dict(analysis),
         "user_k_opt": user_k_opt,
         "user_k_opt_notes": user_k_opt_notes,
@@ -551,6 +568,8 @@ async def get_flow_runs():
                 "duration_s": r.duration_s,
                 "filament_label": r.filament_label,
                 "nozzle_temp": r.nozzle_temp,
+                "printer_model": r.printer_model,
+                "tool_index": r.tool_index,
             }
             for r in runs
         ]
@@ -562,10 +581,17 @@ async def post_flow_run_analyse(filename: str):
     """Re-run `analyse_flow` on a saved flow npz."""
     path = _resolve_run_path(filename, "flow_")
     try:
-        _plan, analysis = replay_flow(path)
+        plan, analysis = replay_flow(path)
     except Exception as exc:
         raise HTTPException(500, f"replay failed: {type(exc).__name__}: {exc}")
-    return {"filename": filename, "analysis": flow_analysis_to_dict(analysis)}
+    return {
+        "filename": filename,
+        "printer_model": normalise_printer_model(plan.params.printer_model),
+        "tool_index": (
+            plan.params.tool_index if is_indx(plan.params.printer_model) else None
+        ),
+        "analysis": flow_analysis_to_dict(analysis),
+    }
 
 
 @app.get("/api/flow/runs/{filename}/export.xlsx")
@@ -668,6 +694,38 @@ async def post_livemap_run():
         run_live_map(
             state.cfg, state.stream, pending["gcode"], pending["parsed"],
             pending["name"], on_update=partial(_broadcast_update, "livemap_run"),
+        ),
+    )
+
+
+@app.post("/api/livemap/attach")
+async def post_livemap_attach():
+    """Capture the pending G-code against the printer's current active job.
+
+    This deliberately performs no upload or printer-control write.  It is the
+    recovery path when PrusaLink starts a large upload but its HTTP response
+    times out, and it is also useful when the tuner is opened just after a
+    telemetry-enabled print has begun.
+    """
+    busy = _busy_reason(starting="livemap")
+    if busy:
+        raise HTTPException(409, busy)
+    if not state.livemap_pending:
+        raise HTTPException(400, "upload the matching .gcode first")
+    _require_printer_config()
+
+    pending = state.livemap_pending
+    return _start_run(
+        "livemap_run",
+        "livemap_run_task",
+        run_live_map(
+            state.cfg,
+            state.stream,
+            pending["gcode"],
+            pending["parsed"],
+            pending["name"],
+            on_update=partial(_broadcast_update, "livemap_run"),
+            attach_existing=True,
         ),
     )
 
@@ -815,6 +873,8 @@ async def get_probe_runs():
                 "n_touches": r.n_touches,
                 "creep_mm": r.creep_mm,
                 "duration_s": r.duration_s,
+                "printer_model": r.printer_model,
+                "tool_index": r.tool_index,
             }
             for r in runs
         ]
@@ -826,10 +886,48 @@ async def post_probe_run_analyse(filename: str):
     """Re-run `analyse_probe` on a saved probe npz."""
     path = _resolve_run_path(filename, "probe_")
     try:
-        _plan, analysis = replay_probe(path)
+        plan, analysis = replay_probe(path)
     except Exception as exc:
         raise HTTPException(500, f"replay failed: {type(exc).__name__}: {exc}")
-    return {"filename": filename, "analysis": probe_analysis_to_dict(analysis)}
+    return {
+        "filename": filename,
+        "printer_model": normalise_printer_model(plan.params.printer_model),
+        "tool_index": (
+            plan.params.tool_index if is_indx(plan.params.printer_model) else None
+        ),
+        "analysis": probe_analysis_to_dict(analysis),
+    }
+
+
+@app.get("/api/livemap/printer-z")
+async def get_livemap_printer_z():
+    """Read the printer's logical Z for authoritative live-layer tracking."""
+    _require_printer_config()
+    try:
+        async with PrusaLinkClient(
+            state.cfg.printer_host,
+            state.cfg.printer_api_key,
+            password=state.cfg.printer_password,
+            user=state.cfg.printer_user,
+            timeout=4.0,
+        ) as printer:
+            status = await printer.status()
+    except Exception as exc:
+        log.warning("livemap printer-z status failed: %s", type(exc).__name__)
+        raise HTTPException(503, "printer status is temporarily unavailable") from exc
+    printer_state = status.get("printer") if isinstance(status, dict) else None
+    axis_z = printer_state.get("axis_z") if isinstance(printer_state, dict) else None
+    if not isinstance(axis_z, (int, float)):
+        raise HTTPException(503, "printer status did not include axis_z")
+    return {
+        "axis_z": float(axis_z),
+        "state": printer_state.get("state"),
+        "online": True,
+        "stale_sec": 0,
+        "run_started_at": (
+            state.livemap_run.state.started_at if state.livemap_run else None
+        ),
+    }
 
 
 @app.get("/api/probe/runs/{filename}/export.xlsx")
@@ -1151,6 +1249,18 @@ async def _broadcast_update(
     run-start endpoints bind `msg_type` ("run" / "flow_run" /
     "livemap_run" / "probe_run") with `functools.partial`.
     """
+    # Keep the in-memory snapshot current while a task is running, not only
+    # after it finishes.  This makes REST status and a newly reconnected
+    # WebSocket able to bootstrap an attached Live Map with its Z/layer seed.
+    run_attr = {
+        "run": "current_run",
+        "flow_run": "flow_run",
+        "livemap_run": "livemap_run",
+        "probe_run": "probe_run",
+    }.get(msg_type)
+    if run_attr is not None:
+        setattr(state, run_attr, run)
+
     payload = {"type": msg_type, "data": run.to_dict()}
     dead: list[WebSocket] = []
     for ws in list(state.ws_clients):

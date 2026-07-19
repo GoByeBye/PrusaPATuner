@@ -27,6 +27,12 @@ class AppConfig:
     printer_api_key: str = ""
     printer_user: str = "maker"
     printer_password: str = ""
+    # Machine profile controls the slicer compatibility token and homing /
+    # tool-selection sequence emitted by every generated test. COREONEINDX
+    # uses Prusa's eight-tool INDX protocol; `tool_index` is the mapped
+    # G-code tool T0..T7 calibrated by a run. Plain COREONE ignores it.
+    printer_model: str = "COREONE"
+    tool_index: int = 0
     udp_port: int = 8514  # Prusa stock metrics port
     server_port: int = 8765
 

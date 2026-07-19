@@ -30,6 +30,11 @@ def test_basic_sweep_contains_per_K_M572():
     # gcode, and tmc_sg_e are silent on this firmware build (verified via
     # /api/diagnostics) so we don't bother M331-ing them.
     assert "M331 loadcell_value" in g
+    assert all(
+        ";" not in line
+        for line in g.splitlines()
+        if line.startswith("M331 ")
+    ), "Buddy requires bare M331 metric names; inline comments break strcmp"
     assert "M331 loadcell_hp" not in g
     assert "M331 gcode" not in g
     assert "M331 tmc_sg_e" not in g

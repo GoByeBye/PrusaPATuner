@@ -196,6 +196,7 @@ def _layers_from_pos_z(
     wx: np.ndarray | None = None,
     wy: np.ndarray | None = None,
     layer_start_xy: list[tuple[float, float]] | None = None,
+    start_layer_index: int = 0,
 ) -> tuple[np.ndarray | None, dict[str, Any]]:
     """Per-window-sample layer indices from the pos_z staircase.
 
@@ -216,7 +217,14 @@ def _layers_from_pos_z(
     be trusted, in which case the caller keeps the coarse arc-length layers.
     """
     n = len(wt)
-    diag: dict[str, Any] = {"available": False, "reason": "", "source": "arc_length"}
+    max_layer = max(0, len(layer_z) - 1)
+    start_layer_index = int(np.clip(start_layer_index, 0, max_layer))
+    diag: dict[str, Any] = {
+        "available": False,
+        "reason": "",
+        "source": "arc_length",
+        "start_layer_index": start_layer_index,
+    }
     if (pos_z_t is None or pos_z is None
             or len(np.atleast_1d(pos_z)) < _Z_MED_WIN or len(layer_z) < 2):
         diag["reason"] = "no usable pos_z stream"
@@ -244,7 +252,10 @@ def _layers_from_pos_z(
     bounds: list[int] = []
     binfo: list[dict[str, Any]] = []
     prev_b = 0
-    for k in range(1, len(zs)):
+    # An attached capture may begin partway through the file. Boundaries below
+    # its printer-reported starting layer have already happened and must not be
+    # recreated at the beginning of the saved stream.
+    for k in range(start_layer_index + 1, len(zs)):
         c_k = int(np.searchsorted(wlayer, k))          # coarse boundary
         W = int(np.clip(0.6 * max(1, min(counts[k - 1], counts[k])), 50, 20000))
         lo = max(prev_b + 1, c_k - W)
@@ -300,7 +311,7 @@ def _layers_from_pos_z(
             "method": method,
         })
 
-    out = np.zeros(n, dtype=int)
+    out = np.full(n, start_layer_index, dtype=int)
     for b in bounds:
         out[b:] += 1
     ds = np.linspace(0, n - 1, min(n, 1500)).astype(int)
@@ -426,6 +437,7 @@ def map_run(
     pos_y_t, pos_y,
     pos_z_t, pos_z,          # rolling-median staircase -> layer boundaries
     parsed: ParsedGcode,
+    start_layer_index: int = 0,
 ) -> MappedRun:
     ft = np.asarray(force_t, dtype=float)
     fy = np.asarray(force_y, dtype=float)
@@ -449,7 +461,12 @@ def map_run(
     X = _interp_axis(ft, pos_t, pos_x)
     Y = _interp_axis(ft, pos_y_t, pos_y)
 
-    ext = [i for i, m in enumerate(parsed.moves) if m.extruding and m.layer >= 0]
+    max_layer = max(0, len(parsed.layers) - 1)
+    start_layer_index = int(np.clip(start_layer_index, 0, max_layer))
+    ext = [
+        i for i, m in enumerate(parsed.moves)
+        if m.extruding and m.layer >= start_layer_index
+    ]
     if not ext or n < 4:
         return _empty(parsed, "no extruding print moves")
     pm = parsed.moves[ext[0]: ext[-1] + 1]
@@ -546,7 +563,7 @@ def map_run(
         layer_starts.append(p0)
     wlayer_z, layer_diag = _layers_from_pos_z(
         wt, wlayer, pos_z_t, pos_z, [lyr.z for lyr in parsed.layers], trav,
-        wx, wy, layer_starts)
+        wx, wy, layer_starts, start_layer_index=start_layer_index)
     if wlayer_z is not None:
         wlayer = wlayer_z
 
@@ -682,6 +699,7 @@ def map_run(
         "pos_fold_dropped": int((pos_fold & ~pos_pile & (pos_gap < _POS_GAP_MAX_S)).sum()),
         "n_hole_breaks": n_hole_breaks,
         "layer_source": layer_diag.get("source", "arc_length"),
+        "start_layer_index": start_layer_index,
         "n_samples": int(s_force.size),
     }
 

@@ -13,22 +13,26 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
+import uuid
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
+import httpx
 
 from .config import AppConfig
 from .gcode_parse import ParsedGcode, parse_gcode
 from .livemap_gen import build_livemap_gcode
 from .livemap_map import MappedRun, map_run
 from .netutil import local_ip_toward
-from .prusalink import PrusaLinkClient
+from .prusalink import JobStatus, PrusaLinkClient
 from .run_lifecycle import (
+    TRANSIENT_HTTPX_ERRORS,
     anchor_fields,
     cancel_collectors,
     collect_metric,
@@ -41,6 +45,79 @@ from .sampling import extract_force, extract_numeric, sort_by_time
 from .udp_metrics import MetricStream
 
 log = logging.getLogger(__name__)
+
+_ACTIVE_JOB_STATES = {"PRINTING", "PAUSED", "BUSY"}
+_TERMINAL_JOB_STATES = {"FINISHED", "STOPPED", "CANCELLED", "IDLE"}
+
+
+def _job_filenames(status: JobStatus) -> list[str]:
+    """Return usable current-job names, preferring PrusaLink display_name."""
+    file_info = status.raw.get("file")
+    if isinstance(file_info, str):
+        values = [file_info]
+    elif isinstance(file_info, dict):
+        values = [
+            file_info.get("display_name"),
+            file_info.get("name"),
+            file_info.get("path"),
+        ]
+    else:
+        values = []
+    return [Path(str(value)).name for value in values if value]
+
+
+def _job_matches_filename(status: JobStatus, expected_filename: str) -> bool:
+    expected = Path(expected_filename).name.casefold()
+    return any(name.casefold() == expected for name in _job_filenames(status))
+
+
+async def _wait_for_uploaded_job(
+    pl: PrusaLinkClient,
+    expected_filename: str,
+    *,
+    grace_s: float,
+    poll_interval_s: float,
+    upload_error: httpx.TransportError | None = None,
+) -> JobStatus:
+    """Reconcile one upload PUT with the exact job that appears afterward.
+
+    PrusaLink may return 204 for several seconds while it finalises a file, and
+    the upload response itself may time out after the firmware accepted it.
+    Polling is safe and read-only; retrying the PUT is not.
+    """
+    deadline = time.monotonic() + max(0.0, grace_s)
+    last_detail = "no job visible"
+    while True:
+        try:
+            status = await pl.get_job_status()
+        except TRANSIENT_HTTPX_ERRORS as exc:
+            status = None
+            last_detail = f"status check failed: {type(exc).__name__}"
+
+        if status is not None:
+            state = status.state.upper()
+            names = _job_filenames(status)
+            matches = _job_matches_filename(status, expected_filename)
+            if matches and (state in _ACTIVE_JOB_STATES or state == "FINISHED"):
+                return status
+            if state in _ACTIVE_JOB_STATES and names and not matches:
+                raise RuntimeError(
+                    "printer started a different job while confirming upload: "
+                    f"expected {expected_filename!r}, got {names[0]!r}; upload "
+                    "was not retried"
+                ) from upload_error
+            if matches and state in _TERMINAL_JOB_STATES:
+                raise RuntimeError(
+                    f"uploaded job entered {state} before collection started"
+                ) from upload_error
+            last_detail = f"state={state}, files={names or ['unknown']}"
+
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "upload outcome is unknown after waiting for the exact printer "
+                f"job {expected_filename!r} ({last_detail}); upload was not retried"
+            ) from upload_error
+        await asyncio.sleep(max(0.0, poll_interval_s))
 
 
 @dataclass(slots=True)
@@ -59,6 +136,9 @@ class LiveMapRun:
     name: str               # original upload filename (for display)
     user_gcode: str         # the uploaded ASCII gcode, untouched
     parsed: ParsedGcode
+    attached_existing: bool = False
+    attach_axis_z: float | None = None
+    attach_layer_index: int | None = None
     state: LiveMapRunState = field(default_factory=LiveMapRunState)
     force_t: list[float] = field(default_factory=list)
     force_y: list[float] = field(default_factory=list)
@@ -88,7 +168,26 @@ class LiveMapRun:
             "n_moves": len(self.parsed.moves),
             "bbox": list(self.parsed.bbox),
             "est_print_s": self.parsed.total_time_s,
+            "attached_existing": self.attached_existing,
+            "attach_axis_z": self.attach_axis_z,
+            "attach_layer_index": self.attach_layer_index,
         }
+
+
+def _nearest_layer_index(parsed: ParsedGcode, axis_z: float) -> int | None:
+    """Return a nearby parsed layer, rejecting setup travel and large Z hops."""
+    if not math.isfinite(axis_z) or not parsed.layers:
+        return None
+    best = min(
+        range(len(parsed.layers)), key=lambda i: abs(parsed.layers[i].z - axis_z)
+    )
+    zs = [layer.z for layer in parsed.layers]
+    pitch = (
+        float(np.median(np.diff(np.asarray(zs, dtype=float))))
+        if len(zs) >= 2 else 0.2
+    )
+    tolerance = max(0.6 * pitch, 0.3)
+    return best if abs(zs[best] - axis_z) <= tolerance else None
 
 
 async def run_live_map(
@@ -102,26 +201,44 @@ async def run_live_map(
     loadcell_metric: str = "loadcell_value",
     poll_interval_s: float = 1.0,
     job_timeout_s: float | None = None,
+    attach_existing: bool = False,
+    upload_start_grace_s: float = 60.0,
+    upload_status_poll_s: float = 0.75,
 ) -> LiveMapRun:
     udp_host = local_ip_toward(cfg.printer_host, port=80)
-    upload_gcode = build_livemap_gcode(
-        user_gcode, udp_host=udp_host, udp_port=cfg.udp_port,
-        loadcell_metric=loadcell_metric,
-    )
+    upload_gcode = None
+    if not attach_existing:
+        upload_gcode = build_livemap_gcode(
+            user_gcode, udp_host=udp_host, udp_port=cfg.udp_port,
+            loadcell_metric=loadcell_metric,
+        )
 
     if job_timeout_s is None:
         est = parsed.total_time_s
         job_timeout_s = max(900.0, 2.0 * est + 600.0)
 
-    run = LiveMapRun(cfg=cfg, name=name, user_gcode=user_gcode, parsed=parsed,
-                     on_update=on_update)
+    run = LiveMapRun(
+        cfg=cfg,
+        name=name,
+        user_gcode=user_gcode,
+        parsed=parsed,
+        attached_existing=attach_existing,
+        on_update=on_update,
+    )
     run.state.started_at = time.time()
     run.state.state = "preparing"
-    run.state.message = (
-        f"Uploading {name} ({len(parsed.layers)} layers, "
-        f"~{parsed.total_time_s / 60:.0f} min est)…"
-    )
-    run.emit()
+    if attach_existing:
+        run.state.message = "Attaching to the print already in progress…"
+    else:
+        run.state.message = (
+            f"Uploading {name} ({len(parsed.layers)} layers, "
+            f"~{parsed.total_time_s / 60:.0f} min est)…"
+        )
+    # Attach mode waits until the read-only printer status query supplies its
+    # current Z/layer seed.  Its first WebSocket snapshot is then immediately
+    # useful to a client joining partway through the print.
+    if not attach_existing:
+        run.emit()
 
     stop_collect = asyncio.Event()
 
@@ -149,10 +266,64 @@ async def run_live_map(
             cfg.printer_host, cfg.printer_api_key,
             password=cfg.printer_password, user=cfg.printer_user or "maker",
         ) as pl:
-            filename = f"livemap_{int(time.time())}.gcode"
-            await pl.upload_and_print(filename, upload_gcode)
+            if attach_existing:
+                status = await pl.get_job_status()
+                if status is None or status.state.upper() not in {
+                    "PRINTING", "PAUSED", "BUSY",
+                }:
+                    current = "no active job" if status is None else status.state
+                    raise RuntimeError(
+                        "cannot attach Live Map: printer is not actively printing "
+                        f"({current})"
+                    )
+                run.state.progress_pct = status.progress_pct
+                try:
+                    printer_status = await pl.status()
+                    raw_axis_z = printer_status.get("printer", {}).get("axis_z")
+                    axis_z = float(raw_axis_z)
+                    layer_index = _nearest_layer_index(parsed, axis_z)
+                    if layer_index is not None:
+                        run.attach_axis_z = axis_z
+                        run.attach_layer_index = layer_index
+                except Exception as exc:
+                    # Z seeding improves the live UI but is not required for
+                    # the server-side capture or its saved offline mapping.
+                    log.warning("could not seed attached Live Map layer from Z: %s", exc)
+            else:
+                filename = (
+                    f"livemap_{int(time.time())}_{uuid.uuid4().hex[:10]}.gcode"
+                )
+                upload_error: httpx.TransportError | None = None
+                try:
+                    await pl.upload_and_print(filename, upload_gcode or b"")
+                except httpx.TransportError as exc:
+                    # The firmware may have accepted Print-After-Upload before
+                    # the response failed. Never repeat this non-idempotent PUT;
+                    # reconcile it by exact display filename instead.
+                    upload_error = exc
+                    log.warning(
+                        "livemap upload response failed (%s); waiting for exact "
+                        "job %s without retrying upload",
+                        type(exc).__name__, filename,
+                    )
+                status = await _wait_for_uploaded_job(
+                    pl,
+                    filename,
+                    grace_s=upload_start_grace_s,
+                    poll_interval_s=upload_status_poll_s,
+                    upload_error=upload_error,
+                )
+                run.state.progress_pct = status.progress_pct
             run.state.state = "running"
-            run.state.message = "Printing; mapping nozzle force live…"
+            if attach_existing and run.attach_layer_index is not None:
+                run.state.message = (
+                    f"Attached at layer {run.attach_layer_index + 1} "
+                    f"(Z {run.attach_axis_z:.2f} mm); mapping nozzle force live…"
+                )
+            elif attach_existing:
+                run.state.message = "Attached to current print; mapping nozzle force live…"
+            else:
+                run.state.message = "Printing; mapping nozzle force live…"
             run.emit()
 
             warned_no_pos = False
@@ -247,6 +418,13 @@ def _dump_livemap_run(run: LiveMapRun) -> str | None:
             pos_x_t=px_t, pos_x=px,
             pos_y_t=py_t, pos_y=py,
             pos_z_t=pz_t, pos_z=pz,
+            attached_existing=np.array([run.attached_existing], dtype=bool),
+            attach_axis_z=np.array([
+                run.attach_axis_z if run.attach_axis_z is not None else np.nan
+            ], dtype=float),
+            attach_layer_index=np.array([
+                run.attach_layer_index if run.attach_layer_index is not None else -1
+            ], dtype=int),
             **anchor_fields(),
             started_at_unix=np.array([float(run.state.started_at)]),
             gcode_bytes=gcode_bytes,
@@ -329,10 +507,26 @@ def replay_livemap(path: str | os.PathLike) -> MappedRun:
         px_t, px = _arr("pos_x_t"), _arr("pos_x")
         py_t, py = _arr("pos_y_t"), _arr("pos_y")
         pz_t, pz = _arr("pos_z_t"), _arr("pos_z")
+        attach_axis_z = npz_scalar(d, "attach_axis_z", float("nan"))
+        raw_start_layer = npz_scalar(d, "attach_layer_index", -1)
         gbytes = d["gcode_bytes"] if "gcode_bytes" in d else np.array([], dtype=np.uint8)
         gcode = bytes(np.asarray(gbytes, dtype=np.uint8)).decode("utf-8", errors="replace")
 
     if force_t is None or force_y is None:
         raise ValueError("run contains no loadcell samples")
     parsed = parse_gcode(gcode)
-    return map_run(force_t, force_y, px_t, px, py_t, py, pz_t, pz, parsed)
+    start_layer_index = (
+        int(raw_start_layer)
+        if math.isfinite(raw_start_layer) and raw_start_layer >= 0
+        else 0
+    )
+    mapped = map_run(
+        force_t, force_y, px_t, px, py_t, py, pz_t, pz, parsed,
+        start_layer_index=start_layer_index,
+    )
+    # Keep the attach seed visible in review diagnostics. Old/full-run files
+    # have neither key and retain the layer-zero defaults.
+    mapped.cross["attach_axis_z"] = (
+        float(attach_axis_z) if math.isfinite(attach_axis_z) else None
+    )
+    return mapped

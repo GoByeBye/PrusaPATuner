@@ -5,13 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "prusa-pa-tuner"
 version = "0.1.0"
-description = "Automatic Linear Advance tuner for the Prusa Core One using the nozzle loadcell over UDP"
+description = "Automatic Pressure Advance tuner for Prusa CORE One and CORE One INDX"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Stefan Hermann (CNC Kitchen)" }]
 license = "AGPL-3.0-or-later"
 license-files = ["LICENSE"]
-keywords = ["3d-printing", "prusa", "core-one", "linear-advance", "pressure-advance", "calibration"]
+keywords = ["3d-printing", "prusa", "core-one", "core-one-indx", "linear-advance", "pressure-advance", "calibration"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
@@ -45,6 +45,9 @@ package = [
 
 [project.scripts]
 prusa-pa-tuner = "prusa_pa_tuner.__main__:main"
+
+[project.urls]
+Upstream = "https://github.com/CNCKitchen/PrusaPATuner"
 
 [tool.setuptools.packages.find]
 where = ["src"]

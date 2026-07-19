@@ -30,6 +30,10 @@ runs/
 *.npz
 *.xlsx
 
+# Generated printer jobs can contain a local metrics host IP and machine-specific
+# motion. Keep them out of commits unless they have been deliberately sanitised.
+*.gcode
+
 # Firmware blobs — not redistributed; stock Buddy firmware streams the
 # metrics this tool needs, no custom build required.
 *.bbf

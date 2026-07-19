@@ -126,7 +126,21 @@ class PrusaLinkClient:
         if print_after_upload:
             headers["Print-After-Upload"] = "?1"
 
-        r = await self._client.put(url, content=body, headers=headers)
+        # File finalisation on Buddy firmware can take substantially longer
+        # than an ordinary status request.  Keep status calls responsive at
+        # the client's normal 15 s timeout, but allow one large upload PUT a
+        # bounded five-minute read/write window.  The caller must reconcile an
+        # ambiguous transport failure; it must never blindly repeat a
+        # Print-After-Upload request.
+        upload_timeout = httpx.Timeout(
+            connect=15.0,
+            read=300.0,
+            write=300.0,
+            pool=15.0,
+        )
+        r = await self._client.put(
+            url, content=body, headers=headers, timeout=upload_timeout
+        )
         if r.status_code >= 400:
             raise PrusaLinkError(
                 f"upload failed: HTTP {r.status_code} — {r.text[:200]}"

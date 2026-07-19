@@ -17,6 +17,51 @@ from __future__ import annotations
 
 from typing import Iterable, Sequence
 
+
+COREONE_MODEL = "COREONE"
+COREONE_INDX_MODEL = "COREONEINDX"
+INDX_TOOL_MIN = 0
+INDX_TOOL_MAX = 7
+
+
+def normalise_printer_model(value: str) -> str:
+    """Return the firmware/slicer model token used in generated G-code.
+
+    Config files and callers may use a friendly ``INDX`` spelling, but the
+    compatibility checks on Prusa CORE One INDX firmware require the exact
+    ``COREONEINDX`` token emitted by PrusaSlicer.
+    """
+    compact = (
+        str(value or COREONE_MODEL)
+        .strip()
+        .upper()
+        .replace(" ", "")
+        .replace("_", "")
+    )
+    if compact in {"COREONE", "CORE1"}:
+        return COREONE_MODEL
+    if compact in {"COREONEINDX", "CORE1INDX", "INDX"}:
+        return COREONE_INDX_MODEL
+    raise ValueError(
+        f"unsupported printer_model {value!r}; expected COREONE or COREONEINDX"
+    )
+
+
+def validated_tool_index(printer_model: str, tool_index: int) -> int:
+    """Validate and return the selected INDX G-code tool (T0..T7)."""
+    model = normalise_printer_model(printer_model)
+    if type(tool_index) is not int:
+        raise ValueError("tool_index must be an integer from 0 through 7")
+    tool = tool_index
+    if model == COREONE_INDX_MODEL and not INDX_TOOL_MIN <= tool <= INDX_TOOL_MAX:
+        raise ValueError("CORE One INDX tool_index must be from 0 through 7")
+    return tool
+
+
+def is_indx(printer_model: str) -> bool:
+    return normalise_printer_model(printer_model) == COREONE_INDX_MODEL
+
+
 # Per-module comment-marker prefixes. The generators tag baseline / sweep /
 # segment boundaries with these so the runner + analyser can slice the
 # timeseries against the gcode plan.
@@ -77,6 +122,7 @@ def slicer_header(
     filament_label: str,
     nozzle_temp: float,
     printer_notes: str,
+    printer_model: str = COREONE_MODEL,
     extra_comment_lines: Iterable[str] = (),
 ) -> None:
     """Forged PrusaSlicer-style header block.
@@ -98,7 +144,8 @@ def slicer_header(
     lines.append("; bed_temperature = 0")
     lines.append("; layer_height = 0.2")
     lines.append("; max_print_height = 280")
-    lines.append("; printer_model = COREONE")
+    model = normalise_printer_model(printer_model)
+    lines.append(f"; printer_model = {model}")
     lines.append(f"; printer_notes = {printer_notes}")
     for extra in extra_comment_lines:
         lines.append(extra)
@@ -109,6 +156,8 @@ def firmware_asserts(
     lines: list[str],
     *,
     nozzle_diameter: float,
+    printer_model: str = COREONE_MODEL,
+    tool_index: int = 0,
     input_shaper_comment: str = "FW feature check",
 ) -> None:
     """Prusa firmware feature assertions.
@@ -118,13 +167,77 @@ def firmware_asserts(
     PrusaSlicer emits so the firmware accepts the gcode without prompting.
     Ends with a blank line.
     """
+    model = normalise_printer_model(printer_model)
+    tool = validated_tool_index(model, tool_index)
     lines.append("M17 ; enable steppers")
-    lines.append(f"M862.1 P{nozzle_diameter} A0 F1 ; nozzle check (HF)")
-    lines.append('M862.3 P "COREONE" ; printer model check')
+    if model == COREONE_INDX_MODEL:
+        lines.append(
+            f"M862.1 T{tool} P{nozzle_diameter} A0 F1 ; selected INDX tool nozzle check (HF)"
+        )
+    else:
+        lines.append(f"M862.1 P{nozzle_diameter} A0 F1 ; nozzle check (HF)")
+    lines.append(f'M862.3 P "{model}" ; printer model check')
     lines.append("M862.5 P2 ; g-code level check")
     lines.append(f'M862.6 P"Input shaper" ; {input_shaper_comment}')
-    lines.append("M115 U6.5.3+12780 ; require Buddy firmware >= 6.5.3")
+    if model == COREONE_INDX_MODEL:
+        # Buddy 6.6.x treats this exact feature declaration as proof that the
+        # file was produced with the current INDX tool-change profile.  Without
+        # it, the firmware pauses at 0% with "Sliced with old INDX profiles".
+        lines.append('M862.6 P"INDX lock" ; current INDX profile feature check')
+        lines.append("M115 U6.6.0+15528 ; require INDX-capable Buddy firmware")
+    else:
+        lines.append("M115 U6.5.3+12780 ; require Buddy firmware >= 6.5.3")
     lines.append("")
+
+
+def home_selected_tool(
+    lines: list[str],
+    *,
+    printer_model: str = COREONE_MODEL,
+    tool_index: int = 0,
+    indx_z_home_temp: float = 120.0,
+) -> bool:
+    """Home the machine and explicitly pick the requested INDX tool.
+
+    Returns ``True`` when the helper heated an INDX nozzle for Z homing.
+    The sequence mirrors the local PrusaSlicer COREONEINDX profile:
+    home XY, pick ``Tn S1 L2 D0``, heat to 120 C, then home Z. A plain
+    CORE One retains the historical all-axis ``G28`` path.
+    """
+    model = normalise_printer_model(printer_model)
+    tool = validated_tool_index(model, tool_index)
+    if model != COREONE_INDX_MODEL:
+        lines.append("G28 ; home")
+        return False
+    lines.append("G28 XY ; home XY before INDX pickup")
+    lines.append(f"T{tool} S1 L2 D0 ; pick INDX tool T{tool} for Z homing")
+    lines.append(f"M104 S{indx_z_home_temp:.0f} ; INDX Z-home temperature")
+    lines.append("G28 Z ; home Z with selected INDX tool")
+    lines.append("G0 Z40 F10000 ; INDX post-home clearance")
+    return True
+
+
+def finish_selected_tool(
+    lines: list[str],
+    *,
+    printer_model: str = COREONE_MODEL,
+    tool_index: int = 0,
+    turn_off_nozzle: bool = True,
+) -> None:
+    """Cool down and finish without leaving an INDX tool on the carriage."""
+    model = normalise_printer_model(printer_model)
+    tool = validated_tool_index(model, tool_index)
+    if model == COREONE_INDX_MODEL:
+        if turn_off_nozzle:
+            lines.append(f"M104 T{tool} S0 ; selected INDX nozzle off")
+        lines.append("P0 S1 ; park INDX tool")
+        lines.append("G1 X242 Y205 F10200 ; clear the INDX dock area")
+        lines.append("G4 ; wait for park moves")
+        lines.append("M84 X Y E ; disable motion/extruder motors")
+        return
+    if turn_off_nozzle:
+        lines.append("M104 S0 ; nozzle off")
+    lines.append("M84 ; disable motors")
 
 
 def metric_setup(
@@ -139,10 +252,16 @@ def metric_setup(
 ) -> None:
     """UDP metric-stream setup: M334 target, M332 silence loop, M331 enables.
 
-    `enables` is (metric, comment) per M331 line -- each module consumes a
-    different stream set and annotates it differently. livemap_gen uses the
-    plain `silence_header` variant and no blank separators (its preamble is
-    a single compact block).
+    `enables` is (metric, comment) for each M331 command -- each module
+    consumes a different stream set and annotates it differently.
+
+    Keep the M331 command itself bare. Buddy's handler compares
+    ``parser.string_arg`` with the metric name using ``strcmp``. Marlin's
+    parser stops scanning at ``;`` but does not terminate the string there,
+    so an inline comment becomes part of the argument and the enable silently
+    fails (``loadcell_value ; comment`` is not ``loadcell_value``).
+    livemap_gen uses the plain `silence_header` variant and no blank
+    separators (its preamble is a single compact block).
     """
     lines.append(f"M334 {udp_host} {udp_port} ; stream metrics to host")
     lines.append(silence_header)
@@ -151,7 +270,9 @@ def metric_setup(
     if blank_after_silence:
         lines.append("")
     for metric, comment in enables:
-        lines.append(f"M331 {metric} ; {comment}")
+        if comment:
+            lines.append(f"; enable {metric}: {comment}")
+        lines.append(f"M331 {metric}")
     if blank_after_enables:
         lines.append("")
 
@@ -166,6 +287,8 @@ def heat_home_setup(
     purge_x: float,
     purge_y: float,
     purge_z: float,
+    printer_model: str = COREONE_MODEL,
+    tool_index: int = 0,
 ) -> float:
     """Stuck-detection off, two-stage preheat + home, absolute-E mode,
     accel pinning, park at the purge position. Returns the preheat setpoint
@@ -191,8 +314,18 @@ def heat_home_setup(
     lines.append("G90 ; absolute XYZ")
 
     preheat = max(preheat_temp, nozzle_temp)
-    lines.append(f"M104 S{preheat:.0f} ; preheat (test temp + headroom)")
-    lines.append("G28 ; home")
+    model = normalise_printer_model(printer_model)
+    if model == COREONE_INDX_MODEL:
+        home_selected_tool(
+            lines,
+            printer_model=model,
+            tool_index=tool_index,
+            indx_z_home_temp=120.0,
+        )
+        lines.append(f"M104 S{preheat:.0f} ; preheat selected INDX tool")
+    else:
+        lines.append(f"M104 S{preheat:.0f} ; preheat (test temp + headroom)")
+        home_selected_tool(lines, printer_model=model, tool_index=tool_index)
     lines.append(f"M109 S{preheat:.0f} ; wait for preheat")
 
     lines.append("G90 ; absolute XYZ (reassert after home)")

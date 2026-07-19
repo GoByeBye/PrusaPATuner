@@ -1,6 +1,7 @@
 // Plain JS — no build step. Talks to the FastAPI backend.
 
 const FIELDS = [
+  "printer_model", "tool_index",
   "printer_host", "printer_user", "printer_password", "printer_api_key", "udp_port",
   "filament_label", "nozzle_temp", "preheat_temp", "nozzle_diameter", "filament_diameter",
   "slow_flow_mm3_s", "slow_volume_mm3", "fast_flow_mm3_s", "fast_volume_mm3",
@@ -18,6 +19,8 @@ const FIELDS = [
   "probe_n_touches", "probe_backoff_mm", "probe_settle_ms", "probe_temp",
 ];
 
+const INTEGER_SELECT_FIELDS = new Set(["tool_index"]);
+
 function $(id) { return document.getElementById(id); }
 
 function readForm() {
@@ -27,6 +30,7 @@ function readForm() {
     if (!el) continue;
     const v = el.value;
     if (el.type === "number") cfg[f] = parseFloat(v);
+    else if (INTEGER_SELECT_FIELDS.has(f)) cfg[f] = parseInt(v, 10);
     else cfg[f] = v;
   }
   return cfg;
@@ -38,6 +42,17 @@ function writeForm(cfg) {
     const el = $(f);
     if (el) el.value = cfg[f];
   }
+  syncPrinterProfile();
+}
+
+function syncPrinterProfile() {
+  const indx = $("printer_model") && $("printer_model").value === "COREONEINDX";
+  const tool = $("tool_index");
+  if (tool) tool.disabled = !indx;
+  const wrap = $("tool_index_wrap");
+  if (wrap) wrap.style.opacity = indx ? "1" : "0.55";
+  const hint = $("indx_tool_hint");
+  if (hint) hint.hidden = !indx;
 }
 
 async function loadConfig() {
@@ -54,18 +69,19 @@ async function saveConfig() {
   });
   if (!r.ok) {
     alert("Save failed: " + (await r.text()));
-    return;
+    return false;
   }
   flash($("btn_save"), "Saved");
+  return true;
 }
 
 async function previewGcode() {
-  await saveConfig();
+  if (!(await saveConfig())) return;
   window.open("/api/preview", "_blank");
 }
 
 async function startRun() {
-  await saveConfig();
+  if (!(await saveConfig())) return;
   const r = await fetch("/api/run", { method: "POST" });
   if (!r.ok) alert("Start failed: " + (await r.text()));
 }
@@ -1410,7 +1426,10 @@ async function copyPressureAdvance() {
     return;
   }
   // Prusa Buddy/Core One uses M572 S<value>, NOT Marlin's M900 K.
-  const txt = `M572 S${k.toFixed(4)} ; PA tuner (${source})`;
+  const toolTag = Number.isInteger(lastRunData.tool_index)
+    ? `, INDX T${lastRunData.tool_index}`
+    : "";
+  const txt = `M572 S${k.toFixed(4)} ; PA tuner (${source}${toolTag})`;
   await navigator.clipboard.writeText(txt);
   $("copy_status").textContent = `Copied: ${txt}`;
   setTimeout(() => ($("copy_status").textContent = ""), 3000);
@@ -1573,11 +1592,11 @@ function setMode(mode) {
 }
 
 async function flowPreview() {
-  await saveConfig();
+  if (!(await saveConfig())) return;
   window.open("/api/flow/preview", "_blank");
 }
 async function startFlow() {
-  await saveConfig();
+  if (!(await saveConfig())) return;
   const r = await fetch("/api/flow/run", { method: "POST" });
   if (!r.ok) alert("Start failed: " + (await r.text()));
 }
@@ -1834,6 +1853,9 @@ const _renderFlowRunMeta = makeRunMetaRenderer({
     const parts = [];
     if (run.filament_label) parts.push(run.filament_label);
     if (run.nozzle_temp > 0) parts.push(`${run.nozzle_temp.toFixed(0)} °C`);
+    if (Number.isInteger(run.tool_index)) {
+      parts.push(`INDX Tool ${run.tool_index + 1} (T${run.tool_index})`);
+    }
     parts.push(`${run.min_flow}–${run.max_flow} mm³/s`);
     return parts.join("  ·  ");
   },
@@ -1844,7 +1866,8 @@ const refreshFlowRunsList = makeRunsRefresher({
   listUrl: "/api/flow/runs",
   store: flowRunsByFilename,
   formatOption: (run, date) =>
-    `${date}  ${run.min_flow}–${run.max_flow} mm³/s  (${run.filename})`,
+    `${date}  ${Number.isInteger(run.tool_index) ? `T${run.tool_index} · ` : ""}` +
+    `${run.min_flow}–${run.max_flow} mm³/s  (${run.filename})`,
   renderMeta: _renderFlowRunMeta,
 });
 
@@ -1877,11 +1900,11 @@ const PROBE_VERDICT_COLOR = {
 };
 
 async function probePreview() {
-  await saveConfig();
+  if (!(await saveConfig())) return;
   window.open("/api/probe/preview", "_blank");
 }
 async function startProbe() {
-  await saveConfig();
+  if (!(await saveConfig())) return;
   const r = await fetch("/api/probe/run", { method: "POST" });
   if (!r.ok) alert("Start failed: " + (await r.text()));
 }
@@ -2068,8 +2091,13 @@ function probeStep(delta) {
 const _renderProbeRunMeta = makeRunMetaRenderer({
   metaElId: "probe_run_meta",
   store: probeRunsByFilename,
-  formatMeta: (run) =>
-    `${run.axis}${run.dir}  ·  ${run.n_touches} touches  ·  ${run.creep_mm} mm creep`,
+  formatMeta: (run) => {
+    const tool = Number.isInteger(run.tool_index)
+      ? `INDX Tool ${run.tool_index + 1} (T${run.tool_index})  ·  `
+      : "";
+    return `${tool}${run.axis}${run.dir}  ·  ${run.n_touches} touches  ·  ` +
+      `${run.creep_mm} mm creep`;
+  },
 });
 
 const refreshProbeRunsList = makeRunsRefresher({
@@ -2077,7 +2105,8 @@ const refreshProbeRunsList = makeRunsRefresher({
   listUrl: "/api/probe/runs",
   store: probeRunsByFilename,
   formatOption: (run, date) =>
-    `${date}  ${run.axis}${run.dir} ${run.n_touches}×  (${run.filename})`,
+    `${date}  ${Number.isInteger(run.tool_index) ? `T${run.tool_index} · ` : ""}` +
+    `${run.axis}${run.dir} ${run.n_touches}×  (${run.filename})`,
   renderMeta: _renderProbeRunMeta,
 });
 
@@ -2164,6 +2193,9 @@ const _renderRunMeta = makeRunMetaRenderer({
     const parts = [];
     if (run.filament_label) parts.push(run.filament_label);
     if (run.nozzle_temp > 0) parts.push(`${run.nozzle_temp.toFixed(0)} °C`);
+    if (Number.isInteger(run.tool_index)) {
+      parts.push(`INDX Tool ${run.tool_index + 1} (T${run.tool_index})`);
+    }
     return parts.join("  @  ");
   },
 });
@@ -2173,7 +2205,8 @@ const refreshRunsList = makeRunsRefresher({
   listUrl: "/api/runs",
   store: runsByFilename,
   formatOption: (run, date) =>
-    `${date}  ${run.n_K}K × ${run.cycles_per_K}cyc  (${run.filename})`,
+    `${date}  ${Number.isInteger(run.tool_index) ? `T${run.tool_index} · ` : ""}` +
+    `${run.n_K}K × ${run.cycles_per_K}cyc  (${run.filename})`,
   renderMeta: _renderRunMeta,
 });
 
@@ -2263,6 +2296,8 @@ async function loadReplay(filename) {
       message: `replay: ${filename}`,
       progress_pct: 100,
       current_k: null,
+      printer_model: data.printer_model,
+      tool_index: data.tool_index,
       analysis: data.analysis,
     };
     renderRun(fakeRun);
@@ -2518,10 +2553,27 @@ const lmap = {
   // travel/feature masking still comes from the saved-run review.
   livePaths: {},       // layerIdx -> {x, y, force, stride, seen}
   liveSeen: 0,         // total force samples placed (across all layers)
-  zTrack: { win: [], cand: 0, run: 0, pitch: 0.3 },
+  // INDX reports pos_z in the toolhead/mesh coordinate frame, which can be
+  // offset from the slicer's nozzle Z.  The tracker therefore stays unarmed
+  // through pickup / wipe, then learns that constant offset when the nozzle
+  // has followed the first-layer extrusion path for a sustained interval.
+  zTrack: {
+    win: [], cand: 0, candSince: null, run: 0, pitch: 0.3,
+    armed: false, offset: null, attachLayer: null, attachAxisZ: null,
+    attachArmedAt: null, anchorSegments: [],
+    anchorSince: null, anchorLastT: null, anchorX: null, anchorY: null,
+    anchorTravel: 0,
+  },
+  axisTrack: {
+    active: false, lastAt: null, cand: null, candSince: null,
+    seedPending: false, inFlight: false,
+  },
   posX: { t: [], v: [] }, posY: { t: [], v: [] }, posZ: { t: [], v: [] },
   posCap: 6000,        // rolling cap on each position buffer
   ptCap: 60000,        // per-layer point cap; the bucket THINS 2x when full
+  captureActive: false, // true after a fresh start or a validated attach seed
+  captureBlocked: false,// mid-print capture has no safe absolute-layer seed
+  runStartedAt: null,   // identifies the active run for reload-safe resume
   curLayer: 0,
   liveLayer: 0,
   followLive: true,
@@ -2534,11 +2586,22 @@ const lmap = {
 function lmResetLive() {
   lmap.livePaths = {};
   lmap.liveSeen = 0;
-  lmap.zTrack = { win: [], cand: 0, run: 0, pitch: _lmLayerPitch() };
+  lmap.zTrack = {
+    win: [], cand: 0, candSince: null, run: 0, pitch: _lmLayerPitch(),
+    armed: false, offset: null, attachLayer: null, attachAxisZ: null,
+    attachArmedAt: null, anchorSegments: [],
+    anchorSince: null, anchorLastT: null, anchorX: null, anchorY: null,
+    anchorTravel: 0,
+  };
+  lmap.axisTrack = {
+    active: false, lastAt: null, cand: null, candSince: null,
+    seedPending: false, inFlight: false,
+  };
   lmap.posX = { t: [], v: [] };
   lmap.posY = { t: [], v: [] };
   lmap.posZ = { t: [], v: [] };
   lmap.liveLayer = 0;
+  if (lmap.summary && lmap.mode === "live") _lmPrepareAnchorGeometry();
 }
 
 // Interpolate v at time t in a (sorted) {t,v} buffer; clamp at the ends.
@@ -2587,46 +2650,301 @@ function _lmLayerPitch() {
 }
 
 // Live layer detection from pos_z (mirrors the offline mapper's staircase
-// idea, but causal): a rolling median over the last ~51 raw samples kills the
-// ±168 mm junk spikes, the nearest gcode layer z is the candidate, and the
-// candidate must hold for LM_Z_CONFIRM consecutive samples before we switch.
-// Medians far off the staircase (pre-print travels, MBL probing) are ignored.
+// idea, but causal).  Raw INDX Z includes a constant tool/mesh offset and its
+// pickup/wipe sequence passes through plausible print heights.  We therefore
+// do not interpret absolute Z until real XY motion has followed the first
+// layer's extrusion path for a short, sustained interval.  That establishes
+// raw_z - slicer_z; only the offset-corrected staircase is tracked afterward.
 const LM_Z_WIN = 51;       // rolling-median window (~0.65 s at 78 Hz)
 const LM_Z_MIN = 25;       // don't trust the median before this many samples
-const LM_Z_CONFIRM = 20;   // consecutive agreeing samples to switch layer
+const LM_Z_CONFIRM_S = 1.5; // sustained height required; rejects INDX Z-hop travel
+const LM_Z_ANCHOR_DIST_MM = 1.0;
+const LM_Z_ANCHOR_HOLD_S = 0.35;
+const LM_Z_ANCHOR_TRAVEL_MM = 2.0;
+const LM_Z_ANCHOR_MAX_SPEED = 80.0;  // first-layer extrusion, not a fast traverse
+const LM_Z_ANCHOR_MAX_GAP_S = 0.20;
+const LM_Z_OFFSET_MAX_MM = 20.0;
+const LM_Z_FOOTPRINT_MARGIN_MM = 2.0;
+const LM_AXIS_Z_CONFIRM_S = 1.0;
+const LM_AXIS_Z_FRESH_S = 4.0;
 
-function _lmTrackLayerZ(z) {
-  if (!Number.isFinite(z) || !lmap.summary) return;
-  const zt = lmap.zTrack;
-  zt.win.push(z);
-  if (zt.win.length > LM_Z_WIN) zt.win.shift();
-  if (zt.win.length < LM_Z_MIN) return;
-  const med = _median(zt.win);
-  const cand = lmLayerOfZ(med);
+function _lmCommitLiveLayer(layer) {
+  if (layer === lmap.liveLayer) return;
+  if (layer < lmap.liveLayer) {
+    // A trusted printer-axis correction supersedes pos_z buckets produced
+    // while mesh compensation looked like the next layer.
+    for (const key of Object.keys(lmap.livePaths)) {
+      if (Number(key) > layer) delete lmap.livePaths[key];
+    }
+  }
+  lmap.liveLayer = layer;
+  if (lmap.followLive) { lmap.curLayer = layer; _lmSyncSlider(); }
+  _lmSaveResumeSeed();
+  lmapRequestRender();
+}
+
+function lmapIngestAxisZ(z, nowS = Date.now() / 1000) {
+  if (!Number.isFinite(z) || !Number.isFinite(nowS) || !lmap.summary
+      || !lmap.captureActive
+      || (!lmap.zTrack.armed && !lmap.axisTrack.seedPending)) return;
+  const at = lmap.axisTrack;
+  at.active = true;
+  at.lastAt = nowS;
+  const cand = lmLayerOfZ(z);
   const zs = lmap.summary.layer_zs || [];
-  // off the staircase (way above/below any layer): pre-print moves, junk
-  if (Math.abs((zs[cand] ?? med) - med) > Math.max(0.6 * zt.pitch, 0.3)) return;
-  if (cand === lmap.liveLayer) { zt.cand = cand; zt.run = 0; return; }
-  zt.run = (cand === zt.cand) ? zt.run + 1 : 1;
-  zt.cand = cand;
-  if (zt.run >= LM_Z_CONFIRM) {
-    zt.run = 0;
-    if (cand < lmap.liveLayer) {
-      // z only ever rises in a real print, so a confirmed downward move means
-      // the earlier upward step was pre-print junk (e.g. the MBL travel
-      // height sitting near a layer z) -- discard what was mis-bucketed.
-      for (const k of Object.keys(lmap.livePaths)) {
-        if (Number(k) > cand) delete lmap.livePaths[k];
+  const pitch = lmap.zTrack.pitch || _lmLayerPitch();
+  // PrusaLink's logical axis_z sits exactly on slicer layer heights. INDX
+  // hops are typically +0.26 mm, i.e. about 0.06 mm away from a 0.2-mm
+  // staircase, so reject them before the dwell gate as well.
+  if (Math.abs((zs[cand] ?? z) - z) > Math.max(0.2 * pitch, 0.04)
+      || (lmap.zTrack.armed && Math.abs(cand - lmap.liveLayer) > 1)) {
+    at.cand = null;
+    at.candSince = null;
+    return;
+  }
+  if (!lmap.zTrack.armed) {
+    if (cand !== at.cand) {
+      at.cand = cand;
+      at.candSince = nowS;
+      return;
+    }
+    if (at.candSince === null || nowS - at.candSince < LM_AXIS_Z_CONFIRM_S) return;
+    at.candSince = null;
+    at.seedPending = false;
+    lmap.zTrack.armed = true;
+    lmap.zTrack.offset = null;  // logical printer Z needs no mesh-frame offset
+    lmap.zTrack.cand = cand;
+    lmap.zTrack.candSince = null;
+    lmap.zTrack.run = 0;
+    lmap.liveLayer = cand;
+    lmap.curLayer = cand;
+    lmap.livePaths = {};
+    lmap.liveSeen = 0;
+    _lmSyncSlider();
+    lmapRequestRender();
+    return;
+  }
+  if (cand === lmap.liveLayer) {
+    at.cand = cand;
+    at.candSince = null;
+    return;
+  }
+  if (cand !== at.cand) {
+    at.cand = cand;
+    at.candSince = nowS;
+    return;
+  }
+  if (at.candSince !== null && nowS - at.candSince >= LM_AXIS_Z_CONFIRM_S) {
+    at.candSince = null;
+    _lmCommitLiveLayer(cand);
+  }
+}
+
+function _lmPrepareAnchorGeometry() {
+  const tracker = lmap.zTrack;
+  lmapGeometry(0).then((geo) => {
+    // A reset/upload may have replaced the tracker while the fetch was in
+    // flight.  Never attach the old file's geometry to the new run.
+    if (lmap.zTrack !== tracker || lmap.mode !== "live") return;
+    const segs = [];
+    for (const p of (geo && geo.polylines) || []) {
+      const n = Math.min((p.x || []).length, (p.y || []).length);
+      for (let i = 1; i < n; i++) {
+        const x0 = Number(p.x[i - 1]), y0 = Number(p.y[i - 1]);
+        const x1 = Number(p.x[i]), y1 = Number(p.y[i]);
+        if ([x0, y0, x1, y1].every(Number.isFinite)) segs.push([x0, y0, x1, y1]);
       }
     }
-    lmap.liveLayer = cand;
-    if (lmap.followLive) { lmap.curLayer = cand; _lmSyncSlider(); }
+    tracker.anchorSegments = segs;
+  });
+}
+
+function _lmPointSegmentDist2(x, y, s) {
+  const vx = s[2] - s[0], vy = s[3] - s[1];
+  const den = vx * vx + vy * vy;
+  const a = den > 0 ? Math.max(0, Math.min(1,
+    ((x - s[0]) * vx + (y - s[1]) * vy) / den)) : 0;
+  const dx = x - (s[0] + a * vx), dy = y - (s[1] + a * vy);
+  return dx * dx + dy * dy;
+}
+
+function _lmNearFirstLayerPath(x, y) {
+  const segs = lmap.zTrack.anchorSegments;
+  const lim2 = LM_Z_ANCHOR_DIST_MM * LM_Z_ANCHOR_DIST_MM;
+  for (const s of segs) if (_lmPointSegmentDist2(x, y, s) <= lim2) return true;
+  return false;
+}
+
+function _lmInsidePrintFootprint(x, y) {
+  if (!lmap.summary || !Array.isArray(lmap.summary.bbox)) return false;
+  const [x0, x1, y0, y1] = lmap.summary.bbox;
+  const m = LM_Z_FOOTPRINT_MARGIN_MM;
+  return Number.isFinite(x) && Number.isFinite(y)
+    && x >= x0 - m && x <= x1 + m && y >= y0 - m && y <= y1 + m;
+}
+
+function _lmResetAnchorCandidate() {
+  const zt = lmap.zTrack;
+  zt.anchorSince = null;
+  zt.anchorLastT = null;
+  zt.anchorX = null;
+  zt.anchorY = null;
+  zt.anchorTravel = 0;
+}
+
+function _lmTryArmLayerTracker(t, x, y) {
+  const zt = lmap.zTrack;
+  if (zt.armed) return zt.attachArmedAt === null || t >= zt.attachArmedAt;
+  if (lmap.axisTrack.seedPending) return false;
+  // An explicit mid-print attach is armed only from its backend-provided
+  // logical layer. Reusing first-layer geometry here can quietly label a
+  // repeated perimeter on (say) layer 31 as layer 1.
+  if (zt.attachLayer !== null) return false;
+  if (zt.win.length < LM_Z_MIN || !zt.anchorSegments.length
+      || !_lmNearFirstLayerPath(x, y)) {
+    _lmResetAnchorCandidate();
+    return false;
+  }
+
+  if (zt.anchorLastT !== null) {
+    const dt = t - zt.anchorLastT;
+    const dist = Math.hypot(x - zt.anchorX, y - zt.anchorY);
+    if (!(dt > 0) || dt > LM_Z_ANCHOR_MAX_GAP_S
+        || (dist > 0.05 && dist / dt > LM_Z_ANCHOR_MAX_SPEED)) {
+      _lmResetAnchorCandidate();
+    } else {
+      zt.anchorTravel += dist;
+    }
+  }
+  if (zt.anchorSince === null) zt.anchorSince = t;
+  zt.anchorLastT = t;
+  zt.anchorX = x;
+  zt.anchorY = y;
+
+  if (t - zt.anchorSince < LM_Z_ANCHOR_HOLD_S
+      || zt.anchorTravel < LM_Z_ANCHOR_TRAVEL_MM) return false;
+
+  const med = _median(zt.win);
+  const dev = zt.win.map((v) => Math.abs(v - med));
+  const mad = _median(dev);
+  // Wait out an actual Z move; the rolling median still rejects the ±168 mm
+  // minority spikes seen in this firmware's raw stream.
+  if (mad > Math.max(0.45 * zt.pitch, 0.08)) return false;
+  const z0 = (lmap.summary.layer_zs || [])[0];
+  const offset = med - z0;
+  if (!Number.isFinite(offset) || Math.abs(offset) > LM_Z_OFFSET_MAX_MM) return false;
+
+  zt.offset = offset;
+  zt.armed = true;
+  zt.cand = 0;
+  zt.candSince = null;
+  zt.run = 0;
+  lmap.liveLayer = 0;
+  lmap.livePaths = {};       // discard pickup/wipe/setup samples completely
+  lmap.liveSeen = 0;
+  if (lmap.followLive) { lmap.curLayer = 0; _lmSyncSlider(); }
+  _lmSaveResumeSeed();
+  lmapRequestRender();
+  return true;
+}
+
+function _lmTrackLayerZ(t, z) {
+  if (!Number.isFinite(z) || !lmap.summary) return;
+  const zt = lmap.zTrack;
+
+  // pos_z includes INDX/mesh compensation and can wander by more than one
+  // 0.2-mm layer across the bed. Prefer the printer's logical axis_z whenever
+  // its read-only status poll is fresh; pos_z remains the offline/fallback
+  // signal if PrusaLink status is unavailable.
+  if (lmap.axisTrack.active && Number.isFinite(lmap.axisTrack.lastAt)
+      && Date.now() / 1000 - lmap.axisTrack.lastAt <= LM_AXIS_Z_FRESH_S) return;
+  if (!Number.isFinite(zt.offset) && zt.armed) return;
+
+  if (!zt.armed && zt.attachLayer !== null) {
+    const x = _lerpAt(t, lmap.posX.t, lmap.posX.v);
+    const y = _lerpAt(t, lmap.posY.t, lmap.posY.v);
+    if (!_lmInsidePrintFootprint(x, y)) {
+      // Do not let a stable INDX dock/wipe height contribute to the attach
+      // seed. A fresh in-footprint window is required after every excursion.
+      zt.win = [];
+      return;
+    }
+    zt.win.push(z);
+    if (zt.win.length > LM_Z_WIN) zt.win.shift();
+    if (zt.win.length < LM_Z_MIN) return;
+
+    const med = _median(zt.win);
+    const mad = _median(zt.win.map((v) => Math.abs(v - med)));
+    if (mad > Math.max(0.45 * zt.pitch, 0.08)) return;
+    const layerZ = (lmap.summary.layer_zs || [])[zt.attachLayer];
+    const offset = med - layerZ;
+    if (!Number.isFinite(offset) || Math.abs(offset) > LM_Z_OFFSET_MAX_MM) return;
+
+    // Commit the layer and offset together before any force sample is allowed
+    // into a live bucket. attachArmedAt also excludes older force samples when
+    // position and force telemetry arrive in separate batches.
+    zt.offset = offset;
+    zt.armed = true;
+    zt.attachArmedAt = t;
+    zt.cand = zt.attachLayer;
+    zt.candSince = null;
+    zt.run = 0;
+    lmap.liveLayer = zt.attachLayer;
+    lmap.curLayer = zt.attachLayer;
+    lmap.livePaths = {};
+    lmap.liveSeen = 0;
+    _lmSyncSlider();
+    _lmSaveResumeSeed();
     lmapRequestRender();
+    return;
+  }
+
+  zt.win.push(z);
+  if (zt.win.length > LM_Z_WIN) zt.win.shift();
+  if (zt.win.length < LM_Z_MIN || !zt.armed) return;
+  const x = _lerpAt(t, lmap.posX.t, lmap.posX.v);
+  const y = _lerpAt(t, lmap.posY.t, lmap.posY.v);
+  if (!_lmInsidePrintFootprint(x, y)) {
+    zt.cand = lmap.liveLayer;
+    zt.candSince = null;
+    zt.run = 0;
+    return;  // ignore INDX dock/wipe motion
+  }
+  const med = _median(zt.win) - zt.offset;
+  const cand = lmLayerOfZ(med);
+  const zs = lmap.summary.layer_zs || [];
+  // Off the corrected staircase: junk / Z hops.  A real print only advances
+  // one parsed layer at a time, so a larger jump is startup/toolchange motion.
+  if (Math.abs((zs[cand] ?? med) - med) > Math.max(0.6 * zt.pitch, 0.3)
+      || cand < lmap.liveLayer || cand > lmap.liveLayer + 1) {
+    zt.cand = lmap.liveLayer;
+    zt.candSince = null;
+    zt.run = 0;
+    return;
+  }
+  if (cand === lmap.liveLayer) {
+    zt.cand = cand;
+    zt.candSince = null;
+    zt.run = 0;
+    return;
+  }
+  if (cand !== zt.cand) {
+    zt.cand = cand;
+    zt.candSince = t;
+    zt.run = 1;
+    return;
+  }
+  zt.run += 1;
+  if (zt.candSince === null) zt.candSince = t;
+  if (t - zt.candSince >= LM_Z_CONFIRM_S) {
+    zt.run = 0;
+    zt.candSince = null;
+    _lmCommitLiveLayer(cand);
   }
 }
 
 function lmapIngestPos(axis, ts, vs) {
-  if (lmap.mode !== "live" || !lmap.summary) return;
+  if (lmap.mode !== "live" || !lmap.summary || !lmap.captureActive) return;
   if (!Array.isArray(ts) || !Array.isArray(vs)) return;
   const buf = axis === "x" ? lmap.posX : axis === "y" ? lmap.posY : lmap.posZ;
   const n = Math.min(ts.length, vs.length);
@@ -2634,7 +2952,7 @@ function lmapIngestPos(axis, ts, vs) {
     // keep strictly increasing time (server already clips, but be safe)
     if (buf.t.length && ts[i] <= buf.t[buf.t.length - 1]) continue;
     buf.t.push(ts[i]); buf.v.push(vs[i]);
-    if (axis === "z") _lmTrackLayerZ(vs[i]);
+    if (axis === "z") _lmTrackLayerZ(ts[i], vs[i]);
   }
   if (buf.t.length > lmap.posCap) {
     const drop = buf.t.length - lmap.posCap;
@@ -2649,13 +2967,14 @@ function _lmLiveBucket(layerIdx) {
 }
 
 function lmapIngestForce(ts, vs) {
-  if (lmap.mode !== "live" || !lmap.summary) return;
+  if (lmap.mode !== "live" || !lmap.summary || !lmap.captureActive) return;
   const n = Math.min(ts.length, vs.length);
   for (let i = 0; i < n; i++) {
     const t = ts[i];
     const x = _lerpAt(t, lmap.posX.t, lmap.posX.v);
     const y = _lerpAt(t, lmap.posY.t, lmap.posY.v);
     if (x === null || y === null) continue;  // no position yet
+    if (!_lmTryArmLayerTracker(t, x, y)) continue;
     const b = _lmLiveBucket(lmap.liveLayer);
     b.seen++;
     lmap.liveSeen++;
@@ -2986,8 +3305,18 @@ async function lmapRender() {
       traces.push(..._lmLivePathTraces(path, cmin, cmax));
       traces.push(_lmColorbarTrace(cmin, cmax));
     }
-    if (!lmap.liveSeen) {
-      legendTxt = "waiting for nozzle-force + position telemetry…";
+    if (!lmap.captureActive) {
+      legendTxt = lmap.captureBlocked
+        ? "live capture was opened after the print started — review the saved run when it finishes"
+        : "ready — live capture and INDX Z calibration begin with Start print & map";
+    } else if (!lmap.zTrack.armed) {
+      legendTxt = lmap.axisTrack.seedPending
+        ? "locating the current layer from printer Z — live points start in about a second…"
+        : lmap.zTrack.anchorSegments.length
+          ? "calibrating INDX Z — pickup/wipe data is ignored until the nozzle follows the first-layer path…"
+          : "loading first-layer geometry for INDX Z calibration…";
+    } else if (!lmap.liveSeen) {
+      legendTxt = "Z calibrated; waiting for nozzle-force + position telemetry…";
     } else {
       const noZ = lmap.posZ.t.length === 0;
       legendTxt =
@@ -3023,12 +3352,25 @@ async function lmapRender() {
     $("lm_layer_label").textContent =
       `layer ${L + 1}/${lmap.summary.n_layers}` +
       (z !== undefined ? ` · z=${Number(z).toFixed(2)} mm` : "") + ` · ${npts} samples`;
+  } else if (!lmap.captureActive) {
+    $("lm_layer_label").textContent = lmap.captureBlocked
+      ? "live · opened mid-print · waiting for saved review"
+      : "live · ready to start";
+  } else if (!lmap.zTrack.armed) {
+    $("lm_layer_label").textContent = lmap.axisTrack.seedPending
+      ? "live · locating current layer from printer Z…"
+      : "live · calibrating INDX Z · pickup/wipe excluded";
   } else {
     const npts = (lmap.livePaths[L] || { x: [] }).x.length;
     $("lm_layer_label").textContent =
       `live · layer ${L + 1}/${lmap.summary.n_layers}` +
       (z !== undefined ? ` · z=${Number(z).toFixed(2)} mm` : "") +
       ` · ${npts} pts (${lmap.liveSeen} total)` +
+      (lmap.axisTrack.active
+        ? " · printer Z"
+        : Number.isFinite(lmap.zTrack.offset)
+          ? ` · Z offset ${Number(lmap.zTrack.offset).toFixed(2)} mm`
+          : "") +
       (lmap.followLive ? " · ● following print" : " · ⏸ pinned — Jump to live to resume");
   }
   $("lm_legend").textContent = legendTxt;
@@ -3062,7 +3404,14 @@ function lmapSetupFromSummary(summary, mode, reviewFile) {
   lmap.reviewCache = {};
   lmap.curLayer = 0;
   lmap.followLive = mode === "live";
-  if (mode === "live") lmResetLive();
+  if (mode === "live") {
+    // Uploading a preview must never consume telemetry from some unrelated
+    // print already on the machine. renderLiveMapRun enables capture only
+    // after this tab observes the matching run begin near 0%.
+    lmap.captureActive = false;
+    lmap.captureBlocked = false;
+    lmResetLive();
+  }
   const s = $("lm_layer_slider");
   if (s) { s.min = "0"; s.max = String(Math.max(0, summary.n_layers - 1)); s.value = "0"; }
   // Seed the load-scale inputs with the auto (percentile) bounds so the user
@@ -3236,11 +3585,129 @@ async function cancelLiveMap() {
   await fetch("/api/livemap/cancel", { method: "POST" });
 }
 
+async function pollLiveMapPrinterZ(nowS = Date.now() / 1000) {
+  if (!lmap.captureActive
+      || lmap.mode !== "live"
+      || (!lmap.zTrack.armed && !lmap.axisTrack.seedPending)) return;
+  const tracker = lmap.axisTrack;
+  const startedAt = lmap.runStartedAt;
+  if (tracker.inFlight) return;
+  tracker.inFlight = true;
+  try {
+    const r = await fetch("/api/livemap/printer-z", { cache: "no-store" });
+    if (!r.ok) return;
+    const s = await r.json();
+    if (lmap.axisTrack !== tracker || lmap.runStartedAt !== startedAt
+        || !lmap.captureActive || lmap.mode !== "live") return;
+    if (tracker.seedPending
+        && (!Number.isFinite(s.run_started_at)
+          || !Number.isFinite(startedAt)
+          || Math.abs(s.run_started_at - startedAt) > 0.01)) return;
+    if (s.online === false || Number(s.stale_sec ?? 0) > 8) return;
+    lmapIngestAxisZ(Number(s.axis_z), nowS);
+  } catch (_) {
+  } finally {
+    if (lmap.axisTrack === tracker) tracker.inFlight = false;
+  }
+}
+
 let lmLastRunState = null;
 let lmLastReviewed = null;  // saved_filename we've already auto-opened for review
 
+const LM_RESUME_KEY = "prusa-pa-tuner-livemap-resume-v1";
+
+function _lmValidResumeSeed(seed, run, zs) {
+  if (!seed || !run || !Array.isArray(zs)) return null;
+  const startedAt = Number(seed.startedAt);
+  const layer = Number(seed.layer);
+  const offset = Number(seed.offset);
+  if (!Number.isFinite(startedAt) || !Number.isFinite(Number(run.started_at))
+      || Math.abs(startedAt - Number(run.started_at)) > 0.01
+      || !Number.isInteger(layer) || layer < 0 || layer >= zs.length
+      || !Number.isFinite(offset) || Math.abs(offset) > LM_Z_OFFSET_MAX_MM) return null;
+  return { startedAt, layer, offset };
+}
+
+function _lmReadResumeSeed(run, zs) {
+  let querySeed = null;
+  try {
+    const q = new URLSearchParams(location.search);
+    if (q.has("lm_resume_run") || q.has("lm_resume_layer") || q.has("lm_resume_offset")) {
+      querySeed = {
+        startedAt: q.get("lm_resume_run"),
+        layer: Number(q.get("lm_resume_layer")),
+        offset: Number(q.get("lm_resume_offset")),
+      };
+    }
+  } catch (_) {}
+  const validQuery = _lmValidResumeSeed(querySeed, run, zs);
+  if (validQuery) return validQuery;
+  try {
+    return _lmValidResumeSeed(JSON.parse(sessionStorage.getItem(LM_RESUME_KEY)), run, zs);
+  } catch (_) { return null; }
+}
+
+function _lmSaveResumeSeed() {
+  if (!lmap.zTrack.armed || !Number.isFinite(lmap.zTrack.offset)
+      || !Number.isFinite(lmap.runStartedAt)) return;
+  try {
+    sessionStorage.setItem(LM_RESUME_KEY, JSON.stringify({
+      startedAt: lmap.runStartedAt,
+      layer: lmap.liveLayer,
+      offset: lmap.zTrack.offset,
+    }));
+  } catch (_) {}
+}
+
+function _lmConfigureRunCapture(run) {
+  const attaching = run.attached_existing === true;
+  const axisZ = run.attach_axis_z;
+  const layer = run.attach_layer_index;
+  const zs = (lmap.summary && lmap.summary.layer_zs) || [];
+  const validAttachSeed = attaching
+    && Number.isFinite(axisZ)
+    && Number.isInteger(layer)
+    && layer >= 0 && layer < zs.length
+    && Number.isFinite(zs[layer])
+    && lmLayerOfZ(axisZ) === layer;
+  const resumeSeed = _lmReadResumeSeed(run, zs);
+  // If an accepted upload is reconciled while the printer is still in its
+  // 0%-startup sequence, axis_z may be a 40-60 mm wipe/home clearance rather
+  // than a print layer. No absolute seed is needed there: use the existing
+  // first-layer footprint calibration exactly as a normal fresh start would.
+  const captureFromStart = (!attaching && run.state === "preparing")
+    || Number(run.progress_pct ?? 100) <= 2 && !validAttachSeed;
+  const seedFromPrinterZ = run.state === "running"
+    && Number(run.progress_pct ?? 0) > 2
+    && !validAttachSeed && resumeSeed === null;
+
+  lmap.captureActive = captureFromStart || validAttachSeed
+    || resumeSeed !== null || seedFromPrinterZ;
+  lmap.captureBlocked = !lmap.captureActive;
+  if (validAttachSeed) {
+    lmap.zTrack.attachAxisZ = axisZ;
+    lmap.zTrack.attachLayer = layer;
+  } else if (resumeSeed) {
+    lmap.zTrack.offset = resumeSeed.offset;
+    lmap.zTrack.armed = true;
+    lmap.zTrack.cand = resumeSeed.layer;
+    lmap.zTrack.candSince = null;
+    lmap.zTrack.run = 0;
+    lmap.liveLayer = resumeSeed.layer;
+    lmap.curLayer = resumeSeed.layer;
+    _lmSyncSlider();
+    _lmSaveResumeSeed();
+  } else if (seedFromPrinterZ) {
+    lmap.axisTrack.seedPending = true;
+    lmapRequestRender();
+    pollLiveMapPrinterZ();
+  }
+}
+
 function renderLiveMapRun(run) {
   if (!run) return;
+  lmap.runStartedAt = Number.isFinite(Number(run.started_at))
+    ? Number(run.started_at) : null;
   $("lm_state").textContent = run.state;
   $("lm_msg").textContent = run.message || "";
   $("lm_pct").textContent = (run.progress_pct ?? 0).toFixed(0);
@@ -3249,17 +3716,29 @@ function renderLiveMapRun(run) {
     || lmLastRunState === "done" || lmLastRunState === "error";
   const nowActive = run.state === "preparing" || run.state === "running";
   if (wasIdle && nowActive) {
-    // A run just started. If we don't have the summary (e.g. page reloaded
-    // mid-print), pull it from the pending endpoint so we can map live.
-    lmResetLive();
     lmap.followLive = true;
-    if (!lmap.summary) {
+    lmap.captureActive = false;
+    lmap.captureBlocked = true;
+    const summaryMatches = lmap.summary
+      && (!run.name || !lmap.summary.name || lmap.summary.name === run.name);
+    if (!summaryMatches) {
       fetch("/api/livemap/pending").then((r) => r.ok ? r.json() : null).then((s) => {
-        if (s) lmapSetupFromSummary(s, "live", null);
+        if (!s) return;
+        lmapSetupFromSummary(s, "live", null);
+        _lmConfigureRunCapture(run);
+        lmapRequestRender();
       });
     } else {
+      // Set live mode before reset: reset conditionally requests layer-0
+      // geometry, and doing this in review mode left anchorSegments empty.
       lmap.mode = "live";
+      lmResetLive();
+      _lmConfigureRunCapture(run);
     }
+  }
+  if (!nowActive) {
+    lmap.captureActive = false;
+    try { sessionStorage.removeItem(LM_RESUME_KEY); } catch (_) {}
   }
   lmLastRunState = run.state;
 
@@ -3314,6 +3793,8 @@ async function loadLiveMapReview(filename) {
 
 // ---- wire up ----
 document.addEventListener("DOMContentLoaded", () => {
+  $("printer_model").addEventListener("change", syncPrinterProfile);
+  syncPrinterProfile();
   $("btn_save").onclick = saveConfig;
   $("btn_preview").onclick = previewGcode;
   $("btn_run").onclick = startRun;
@@ -3379,7 +3860,17 @@ document.addEventListener("DOMContentLoaded", () => {
     exportUrl: (fn) => `/api/livemap/runs/${encodeURIComponent(fn)}/export.xlsx`,
   });
   refreshLiveMapRuns();
+  // The backend keeps the last parsed upload in memory. Recover it after a
+  // page reload (or a guarded service restart) so the user does not have to
+  // choose the same 2 MB file again just to restore the preview/run button.
+  fetch("/api/livemap/pending").then((r) => r.ok ? r.json() : null).then((s) => {
+    if (!s || lmap.summary) return;
+    lmapSetupFromSummary(s, "live", null);
+    $("lm_run").disabled = false;
+  });
   setInterval(lmapTick, 200);
+  setInterval(pollLiveMapPrinterZ, 1000);
+  pollLiveMapPrinterZ();
   $("btn_flow_save").onclick = saveConfig;
   $("btn_flow_preview").onclick = flowPreview;
   $("btn_flow_run").onclick = startFlow;

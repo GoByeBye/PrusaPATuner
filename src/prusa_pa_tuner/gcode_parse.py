@@ -7,7 +7,8 @@ Used by the Live Map module to:
       streamed toolhead position (see livemap_map.cross_check).
 
 We parse PrusaSlicer-flavoured ASCII gcode:
-  * G0/G1 motion with G90/G91 (XYZ abs/rel), M82/M83 (E abs/rel), G92 origin
+  * G0/G1 motion plus PrusaSlicer G2/G3 XY arcs with relative I/J centres;
+    G90/G91 (XYZ abs/rel), M82/M83 (E abs/rel), G92 origin
   * `;TYPE:<feature>` feature comments (perimeter / infill / ...)
   * `;LAYER_CHANGE` + `;Z:<height>` layer markers (with a z-binning fallback
     for gcode that lacks them)
@@ -32,6 +33,16 @@ _Z_RE = re.compile(r"^\s*;\s*Z:\s*([0-9]*\.?[0-9]+)", re.IGNORECASE)
 # Two extruding moves whose start/end z differ by less than this are the
 # same layer (covers float noise + z-hop residue).
 _Z_EPS = 0.02
+
+# PrusaSlicer's ``arc_fitting = emit_center`` writes G2/G3 moves in the XY
+# plane with relative I/J centre offsets.  Live Map needs those curves in its
+# geometry model, but the rest of the mapper deliberately works with straight
+# segments.  Tessellate finely enough to preserve the printed path without
+# turning every arc into hundreds of points.  The angular cap matters for
+# very small-radius arcs whose total length is below the linear cap.
+_ARC_SEGMENT_MM = 0.5
+_ARC_SEGMENT_RAD = math.radians(10.0)
+_ARC_RADIUS_MISMATCH_MM = 0.05
 
 
 @dataclass(slots=True)
@@ -99,12 +110,87 @@ def _axes(tokens: list[str]) -> dict[str, float]:
         if not tok:
             continue
         letter = tok[0].upper()
-        if letter in ("X", "Y", "Z", "E", "F"):
+        if letter in ("X", "Y", "Z", "E", "F", "I", "J", "R"):
             try:
                 out[letter] = float(tok[1:])
             except ValueError:
                 continue
     return out
+
+
+def _xy_arc_points(
+    x0: float,
+    y0: float,
+    z0: float,
+    x1: float,
+    y1: float,
+    z1: float,
+    axes: dict[str, float],
+    *,
+    clockwise: bool,
+) -> tuple[list[tuple[float, float, float]], float] | None:
+    """Tessellate one PrusaSlicer-style XY arc.
+
+    Buddy/Marlin and PrusaSlicer use incremental I/J centre offsets for the
+    emitted G17 arcs, independent of G90/G91 endpoint mode.  ``None`` means
+    the command is outside that supported shape (for example an R arc or an
+    inconsistent radius); the caller then keeps a single endpoint chord so
+    machine position still advances instead of poisoning every later move.
+
+    The returned length is the true circular XY path length.  Callers use it
+    once for the command-level time model, then divide that duration across
+    the straight display/mapping segments.  Treating every tessellated chord
+    as a separately stopping command would badly inflate estimated time.
+    """
+    if "I" not in axes and "J" not in axes:
+        return None
+
+    cx = x0 + axes.get("I", 0.0)
+    cy = y0 + axes.get("J", 0.0)
+    r0 = math.hypot(x0 - cx, y0 - cy)
+    r1 = math.hypot(x1 - cx, y1 - cy)
+    if r0 <= 1e-9:
+        return None
+    if abs(r0 - r1) > max(_ARC_RADIUS_MISMATCH_MM, 0.01 * max(r0, r1)):
+        return None
+
+    a0 = math.atan2(y0 - cy, x0 - cx)
+    a1 = math.atan2(y1 - cy, x1 - cx)
+    if clockwise:
+        sweep = -((a0 - a1) % (2.0 * math.pi))
+    else:
+        sweep = (a1 - a0) % (2.0 * math.pi)
+    # Identical endpoints with a valid non-zero radius denote a full circle.
+    if abs(sweep) <= 1e-12 and math.hypot(x1 - x0, y1 - y0) <= 1e-9:
+        sweep = -2.0 * math.pi if clockwise else 2.0 * math.pi
+    if abs(sweep) <= 1e-12:
+        return None
+
+    radius = 0.5 * (r0 + r1)
+    arc_len = radius * abs(sweep)
+    n = max(
+        1,
+        math.ceil(arc_len / _ARC_SEGMENT_MM),
+        math.ceil(abs(sweep) / _ARC_SEGMENT_RAD),
+    )
+    points: list[tuple[float, float, float]] = []
+    for j in range(1, n + 1):
+        f = j / n
+        if j == n:
+            # Preserve the exact commanded endpoint; slicer coordinates are
+            # rounded, so it can differ from the reconstructed circle by a few
+            # microns even though the command is valid.
+            points.append((x1, y1, z1))
+            continue
+        a = a0 + sweep * f
+        points.append(
+            (
+                cx + radius * math.cos(a),
+                cy + radius * math.sin(a),
+                z0 + (z1 - z0) * f,
+            )
+        )
+    return points, arc_len
 
 
 def parse_gcode(text: str, *, default_accel: float = 2000.0) -> ParsedGcode:
@@ -114,6 +200,8 @@ def parse_gcode(text: str, *, default_accel: float = 2000.0) -> ParsedGcode:
 
     abs_xyz = True
     abs_e = True
+    plane = "G17"
+    arc_centers_relative = True
     x = y = z = 0.0
     last_e = 0.0
     feed_mm_min = 1200.0
@@ -178,6 +266,15 @@ def parse_gcode(text: str, *, default_accel: float = 2000.0) -> ParsedGcode:
         tokens = line.split()
         code = tokens[0].upper()
 
+        if code in ("G17", "G18", "G19"):
+            plane = code
+            continue
+        if code == "G90.1":
+            arc_centers_relative = False
+            continue
+        if code == "G91.1":
+            arc_centers_relative = True
+            continue
         if code in ("G90",):
             abs_xyz = True
             continue
@@ -212,7 +309,7 @@ def parse_gcode(text: str, *, default_accel: float = 2000.0) -> ParsedGcode:
             if "T" in a:
                 accel_travel = a["T"]
             continue
-        if code not in ("G0", "G1", "G00", "G01"):
+        if code not in ("G0", "G1", "G00", "G01", "G2", "G3", "G02", "G03"):
             continue
 
         a = _axes(tokens)
@@ -241,13 +338,30 @@ def parse_gcode(text: str, *, default_accel: float = 2000.0) -> ParsedGcode:
         dy = y1 - y
         dz = z1 - z
         xy = math.hypot(dx, dy)
-        if xy > 1e-9:
-            length = xy
+        is_arc = code in ("G2", "G3", "G02", "G03")
+        arc = (
+            _xy_arc_points(
+                x, y, z, x1, y1, z1, a,
+                clockwise=code in ("G2", "G02"),
+            )
+            if is_arc and plane == "G17" and arc_centers_relative else None
+        )
+        if arc is not None:
+            points, path_xy = arc
+        else:
+            # Unsupported/malformed arcs degrade to their endpoint chord.  It
+            # is more important to advance XYZ/E state than to let one command
+            # shift every subsequent segment, which was the old failure mode.
+            points = [(x1, y1, z1)]
+            path_xy = xy
+
+        if path_xy > 1e-9:
+            length = path_xy
         elif abs(dz) > 1e-9:
             length = abs(dz)
         else:
             length = abs(de)
-        extruding = de > 1e-6 and xy > 1e-9
+        extruding = de > 1e-6 and path_xy > 1e-9
 
         # --- layer assignment ---
         # Marker mode: a `;LAYER_CHANGE` armed `expect_new_layer`; open the
@@ -270,26 +384,40 @@ def parse_gcode(text: str, *, default_accel: float = 2000.0) -> ParsedGcode:
         accel = accel_print if extruding else accel_travel
         dur = _move_time_s(length, feed_mm_s, accel)
 
-        mv = Move(
-            x0=x, y0=y, z0=z, x1=x1, y1=y1, z1=z1,
-            e=de, feed_mm_s=feed_mm_s, feature_idx=cur_feature,
-            layer=cur_layer, extruding=extruding, length_mm=length,
-            t_start=t_cursor, t_end=t_cursor + dur,
-        )
-        pg.moves.append(mv)
+        # Keep one command's stop/start time as one command even though arcs
+        # are represented by several linear Move objects for geometry.  Arc
+        # segments have equal angular/path spans, so equal time slices are the
+        # appropriate command-level approximation.
+        n_parts = len(points)
+        px, py, pz = x, y, z
+        for j, (qx, qy, qz) in enumerate(points, 1):
+            t0 = t_cursor + dur * ((j - 1) / n_parts)
+            t1 = t_cursor + dur * (j / n_parts)
+            mv = Move(
+                x0=px, y0=py, z0=pz, x1=qx, y1=qy, z1=qz,
+                e=de / n_parts, feed_mm_s=feed_mm_s, feature_idx=cur_feature,
+                layer=cur_layer, extruding=extruding,
+                length_mm=length / n_parts,
+                t_start=t0, t_end=t1,
+            )
+            pg.moves.append(mv)
+
+            # bbox from real-print extrusion segments.  Arc tessellation adds
+            # intermediate extrema that an endpoint-only chord would miss.
+            if extruding and cur_layer >= 0:
+                xmin = min(xmin, px, qx)
+                xmax = max(xmax, px, qx)
+                ymin = min(ymin, py, qy)
+                ymax = max(ymax, py, qy)
+            px, py, pz = qx, qy, qz
+
         if cur_layer >= 0:
             pg.layers[cur_layer].move_hi = len(pg.moves)
         t_cursor += dur
 
-        # bbox + extruding count from real-print moves only (layer >= 0), so
-        # the purge line / start gcode doesn't blow the footprint out to the
-        # whole bed.
+        # Count source extrusion commands, not tessellated display segments.
         if extruding and cur_layer >= 0:
             pg.n_extruding += 1
-            xmin = min(xmin, x, x1)
-            xmax = max(xmax, x, x1)
-            ymin = min(ymin, y, y1)
-            ymax = max(ymax, y, y1)
 
         x, y, z = x1, y1, z1
 

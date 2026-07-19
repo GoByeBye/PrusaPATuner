@@ -9,9 +9,10 @@ Each stream (loadcell, pos_x, pos_y, pos_z) becomes its own sheet with:
 A `meta` sheet lists the scalar plan parameters (k_values, cycle_period_s, ...).
 """
 import argparse
-import numpy as np
-import pandas as pd
+from datetime import UTC, datetime
 
+import numpy as np
+from openpyxl import Workbook
 
 # Map of (timestamp-array-name, value-array-name, sheet-name).
 STREAMS = [
@@ -42,41 +43,64 @@ def _wall_clock_anchor(d) -> tuple[float, float] | None:
 
 
 def npz2xlsx(src: str, dst: str) -> None:
-    d = np.load(src)
-    anchor = _wall_clock_anchor(d)
+    with np.load(src) as d:
+        anchor = _wall_clock_anchor(d)
+        workbook = Workbook()
+        workbook.remove(workbook.active)
 
-    with pd.ExcelWriter(dst, engine="openpyxl") as xw:
         for tk, vk, sheet in STREAMS:
             if tk not in d.files or vk not in d.files:
                 continue
-            t = d[tk]
-            v = d[vk]
+            t = np.ravel(d[tk])
+            v = np.ravel(d[vk])
             if t.size == 0 or v.size == 0:
                 continue
-            cols = {
-                "t_monotonic": t,
-                "t_rel_s": t - t[0],
-            }
+            if t.size != v.size:
+                raise ValueError(f"{tk} and {vk} have different lengths")
+
+            worksheet = workbook.create_sheet(sheet)
+            header = ["t_monotonic", "t_rel_s"]
             if anchor is not None:
-                mono_a, unix_a = anchor
-                unix_ts = t - mono_a + unix_a
-                cols["t_wall_utc"] = pd.to_datetime(unix_ts, unit="s", utc=True)
-            cols[sheet] = v
-            pd.DataFrame(cols).to_excel(xw, sheet_name=sheet, index=False)
+                header.append("t_wall_utc")
+            header.append(sheet)
+            worksheet.append(header)
+
+            for timestamp, value in zip(t, v, strict=True):
+                row = [float(timestamp), float(timestamp - t[0])]
+                if anchor is not None:
+                    mono_a, unix_a = anchor
+                    wall_time = float(timestamp) - mono_a + unix_a
+                    row.append(
+                        datetime.fromtimestamp(wall_time, UTC)
+                        .isoformat()
+                        .replace("+00:00", "Z")
+                    )
+                row.append(value.item() if isinstance(value, np.generic) else value)
+                worksheet.append(row)
 
         # meta sheet: one column per scalar
-        meta_cols = {}
+        meta_cols: dict[str, list[object]] = {}
         for k in SCALAR_KEYS:
             if k in d.files:
-                arr = d[k]
-                meta_cols[k] = arr if arr.size else [None]
+                arr = np.ravel(d[k])
+                meta_cols[k] = [v.item() if isinstance(v, np.generic) else v for v in arr]
+                if not meta_cols[k]:
+                    meta_cols[k] = [None]
         if meta_cols:
-            # Pad to the longest column for a tidy single-sheet view.
+            worksheet = workbook.create_sheet("meta")
+            worksheet.append(list(meta_cols))
             max_len = max(len(v) for v in meta_cols.values())
-            for k, v in list(meta_cols.items()):
-                if len(v) < max_len:
-                    meta_cols[k] = list(v) + [None] * (max_len - len(v))
-            pd.DataFrame(meta_cols).to_excel(xw, sheet_name="meta", index=False)
+            for row_index in range(max_len):
+                worksheet.append(
+                    [
+                        values[row_index] if row_index < len(values) else None
+                        for values in meta_cols.values()
+                    ]
+                )
+
+        if not workbook.sheetnames:
+            workbook.create_sheet("meta")
+        workbook.save(dst)
 
 
 if __name__ == "__main__":

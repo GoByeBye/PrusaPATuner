@@ -1,12 +1,18 @@
 # Prusa PA Tuner
 
 Automatic **Pressure Advance (`M572 S`)** calibration for **Prusa printers with a nozzle
-loadcell** (Core One, MK4 / MK4S, MK3.9, XL), using the loadcell as a back-pressure
-sensor — no extra hardware, no printed test patches, no eyeballing of corner artefacts.
+loadcell**, including the eight-tool **CORE One INDX**, using the loadcell as a
+back-pressure sensor — no extra hardware, no printed test patches, no eyeballing of
+corner artefacts.
 
 > **Status:** experimental. Works on current stock Buddy firmware — see
 > [Step 0](#step-0--activate-the-metrics-on-the-printer) for how to enable the metrics
 > stream the tool relies on.
+
+This repository is a fork of
+[`CNCKitchen/PrusaPATuner`](https://github.com/CNCKitchen/PrusaPATuner). It preserves
+the upstream Git history and AGPL license; fork-specific changes currently focus on
+CORE One INDX support and more robust live-map tracking.
 
 ## Research project
 
@@ -50,6 +56,10 @@ on the printer's stock loadcell over UDP.
 ## Supported printers
 
 - **Prusa Core One** — primary development target.
+- **Prusa CORE One INDX** — supported with its exact `COREONEINDX` compatibility
+  profile. Select one mapped G-code tool (`T0`–`T7`, shown as Tool 1–8) per PA,
+  Max Flow, or Touch Probe run; the generated job performs the INDX pickup, 120 °C
+  Z-homing, and end-of-run park sequence for that tool.
 - **Prusa MK4 / MK4S / MK3.9** — same loadcell, same Buddy firmware family. Should work
   with no changes; community testing very welcome.
 - **Prusa XL** — has the loadcell. Multi-tool sequencing is not handled yet, so you'll
@@ -121,7 +131,7 @@ printer runs Klipper.
 ## Install
 
 ```bash
-git clone https://github.com/CNCKitchen/PrusaPATuner
+# Clone this fork using the URL from GitHub's Code button, then:
 cd PrusaPATuner
 python -m venv .venv
 # Windows:
@@ -151,12 +161,17 @@ configures its own streaming in the G-code preamble: `M334` (re)targets your hos
 `M332` silences the low-rate default metrics (the metrics throttle on Buddy is
 compile-time, and every extra active stream eats into the UDP budget — fewer is
 faster), and `M331` enables exactly the streams the analyser consumes
-(`loadcell_value`, `pos_x`, `pos_y`, `pos_z`).
+(`loadcell_value`, `pos_x`, `pos_y`, `pos_z`). Buddy requires the argument to an
+`M331` command to be the bare metric name; an inline `; comment` becomes part of
+the literal name and makes the enable fail invisibly.
 
-> **Metric state is RAM-only.** `M331`/`M332`/`M334` settings revert on every power
-> cycle. The generated jobs re-apply them at the start of each run, so this is
-> normally invisible — but if packets stop after a printer reboot, re-check the
-> Metrics & Log settings on the touchscreen first.
+> **Approve the first target change.** If `M334` changes the host, port, or global
+> enable state, Buddy pauses with a Metrics configuration prompt. Answer **Yes**
+> on the printer; otherwise the new UDP target is not applied.
+
+> **Per-metric toggles are RAM-only.** The `M334` host/ports and global enable are
+> persisted, but `M331`/`M332` selections revert to firmware defaults after a
+> power cycle. Generated jobs re-apply the required selections at every run.
 
 > **Why the tool doesn't trust ad-hoc `M331` over PrusaLink:** Buddy silently no-ops
 > on unknown metric names — the "Metric not found" reply goes to the serial console
@@ -170,8 +185,9 @@ python scripts/sniff.py --prusalink-host <printer-IP> --password <PrusaLink-pass
 ```
 
 In this mode `sniff.py` enables a diagnostic metric set itself over PrusaLink (and
-disables it again on Ctrl-C). You should at minimum see `loadcell_value` ticking at
-~180 Hz. Several loadcell-family metrics (`loadcell_hp` among them) are registered in
+disables it again on Ctrl-C). You should at minimum see `loadcell_value` ticking well
+above 100 Hz (about 350 Hz on the tested INDX). Several loadcell-family metrics
+(`loadcell_hp` among them) are registered in
 the firmware but silent on current stock builds — don't worry if they stay at 0 Hz.
 If everything is silent, check (in order):
 
@@ -257,7 +273,8 @@ python -m prusa_pa_tuner
 
 A browser opens at <http://127.0.0.1:8765/>.
 
-1. **Printer** — enter the printer's IP and PrusaLink password.
+1. **Printer** — enter the printer's IP and PrusaLink password. For a CORE One INDX,
+   select the INDX machine profile and the mapped tool to calibrate (Tool 1–8 / T0–T7).
 2. **Filament & temps** — material label, nozzle temp, bed temp.
 3. **Sweep parameters** — defaults match bd_pressure's granularity:
    K from 0.00 to 0.10 in 0.002 steps, slow 1.92 mm³/s × 1.0 s, fast 19.24 mm³/s ×
@@ -289,7 +306,8 @@ experimental pending broader hardware testing:
   volumetric flow from loadcell back-pressure (sub-linear power-law fit,
   variance-rise and collapse detection) instead of squinting at extrusion quality.
 - **Live Map** — maps loadcell force onto a 2D preview of the G-code during a real
-  print, per layer, so you can see *where in the part* extrusion pressure spikes.
+  print, per layer, so you can see *where in the part* extrusion pressure spikes. Its
+  metrics-only wrapper preserves the sliced file's own INDX tool changes.
 - **Touch Probe** — lateral ±X/±Y sensitivity characterization: how much of a
   sideways nozzle contact does the (axial) loadcell actually see?
 
@@ -375,6 +393,16 @@ User-specific config (printer IP, PrusaLink password) is stored *outside the rep
 `%APPDATA%/PrusaPATuner/config.json` on Windows or `~/.prusa_pa_tuner/config.json`
 elsewhere, and is loaded/saved by the web UI. Nothing printer-identifying is committed
 back into the working tree.
+
+Generated `.gcode` jobs are also ignored because they can embed the local metrics host
+IP and printer-specific motion. Review and sanitise one explicitly before adding it as
+an example.
+
+## Contributing and security
+
+Bug reports and patches are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the
+local validation commands. Please report sensitive issues using the process in
+[`SECURITY.md`](SECURITY.md), rather than opening a public issue.
 
 ## License
 

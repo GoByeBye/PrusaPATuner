@@ -1599,7 +1599,18 @@ def _quadratic_zero_crossing(
         return _linear_fit_zero_crossing(k_values, y_values, method)
 
     a, b, c = np.polyfit(k, y, 2)
-    if a == 0.0:
+    k_span = float(np.ptp(k))
+    fit_scale = max(
+        abs(float(b)) * k_span,
+        abs(float(c)),
+        float(np.max(np.abs(y))),
+        np.finfo(float).tiny,
+    )
+    # A least-squares quadratic fitted to exactly linear data usually returns a
+    # tiny non-zero ``a``. Feeding that through the quadratic formula amplifies
+    # cancellation and can turn the real crossing into zero. Treat curvature
+    # that is negligible over the observed K span as linear.
+    if abs(float(a)) * k_span * k_span <= 1e-10 * fit_scale:
         return _linear_fit_zero_crossing(k_values, y_values, method)
 
     disc = b * b - 4.0 * a * c

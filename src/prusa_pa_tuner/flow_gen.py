@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from .gcode_preamble import (
     FLOW_MARKER_PREFIX,
     baseline_dwell,
+    finish_selected_tool,
     firmware_asserts,
     heat_home_setup,
     metric_setup,
@@ -53,6 +54,8 @@ class FlowRampParams:
     nozzle_diameter: float = 0.4
     filament_diameter: float = 1.75
     filament_label: str = "PLA"
+    printer_model: str = "COREONE"
+    tool_index: int = 0
 
     # Sweep range (volumetric flow, mm³/s). Inclusive of max when it lands
     # on the grid.
@@ -138,10 +141,16 @@ def build_flow_ramp(params: FlowRampParams) -> FlowPlan:
         filament_label=p.filament_label,
         nozzle_temp=p.nozzle_temp,
         printer_notes="PrusaPATuner -- free-air max-flow test",
+        printer_model=p.printer_model,
         extra_comment_lines=(f"; flow_levels_mm3_s = {list(levels)}",),
     )
 
-    firmware_asserts(lines, nozzle_diameter=p.nozzle_diameter)
+    firmware_asserts(
+        lines,
+        nozzle_diameter=p.nozzle_diameter,
+        printer_model=p.printer_model,
+        tool_index=p.tool_index,
+    )
 
     # ---- metrics: stream to host, silence noise, enable what we consume ----
     # loadcell_value = primary back-pressure signal; pos_z = Z-marker
@@ -168,6 +177,8 @@ def build_flow_ramp(params: FlowRampParams) -> FlowPlan:
         purge_x=p.purge_x,
         purge_y=p.purge_y,
         purge_z=p.purge_z,
+        printer_model=p.printer_model,
+        tool_index=p.tool_index,
     )
 
     cum_e = 0.0
@@ -246,7 +257,10 @@ def build_flow_ramp(params: FlowRampParams) -> FlowPlan:
 
     # cleanup
     lines.append("M591 R ; restore stuck detection")
-    lines.append("M104 S0 ; nozzle off")
-    lines.append("M84 ; disable motors")
+    finish_selected_tool(
+        lines,
+        printer_model=p.printer_model,
+        tool_index=p.tool_index,
+    )
 
     return FlowPlan(gcode="\n".join(lines) + "\n", segments=segments, params=p)

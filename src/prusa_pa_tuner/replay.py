@@ -27,6 +27,7 @@ import numpy as np
 
 from .analysis import SweepAnalysis, analyse_sweep
 from .gcode_gen import SweepParams, SweepPlan, build_sweep
+from .gcode_preamble import is_indx
 
 
 @dataclass(slots=True)
@@ -48,6 +49,8 @@ class RunInfo:
     # empty / 0 and the UI hides the line.
     filament_label: str = ""
     nozzle_temp: float = 0.0
+    printer_model: str = "COREONE"
+    tool_index: int | None = None
     # User-supplied ground-truth K (the value the user measured from a
     # test print) and free-text notes. Set via annotate_run() after the
     # dump is written. None when the run has never been annotated.
@@ -107,6 +110,16 @@ def list_runs(runs_dir: str | os.PathLike = "runs") -> list[RunInfo]:
                         nozzle_temp = float(d["nozzle_temp"][0])
                     except Exception:
                         nozzle_temp = 0.0
+                printer_model = (
+                    str(d["printer_model"][0])
+                    if "printer_model" in d and len(d["printer_model"])
+                    else "COREONE"
+                )
+                raw_tool = (
+                    int(d["tool_index"][0])
+                    if "tool_index" in d and len(d["tool_index"])
+                    else -1
+                )
                 user_k_opt: float | None = None
                 if "user_k_opt" in d and len(d["user_k_opt"]):
                     try:
@@ -134,6 +147,12 @@ def list_runs(runs_dir: str | os.PathLike = "runs") -> list[RunInfo]:
                     duration_s=duration,
                     filament_label=filament_label,
                     nozzle_temp=nozzle_temp,
+                    printer_model=printer_model,
+                    tool_index=(
+                        raw_tool
+                        if is_indx(printer_model) and 0 <= raw_tool <= 7
+                        else None
+                    ),
                     user_k_opt=user_k_opt,
                     user_k_opt_notes=user_k_opt_notes,
                 )
@@ -234,7 +253,15 @@ def load_run(path: str | os.PathLike) -> tuple[SweepPlan, dict[str, Any]]:
             return float(d[key][0]) if key in d and len(d[key]) else default
 
         coupled_dx_mm_saved = _get("coupled_dx_mm", -1.0)
+        printer_model = (
+            str(d["printer_model"][0])
+            if "printer_model" in d and len(d["printer_model"])
+            else "COREONE"
+        )
+        raw_tool = int(_get("tool_index", 0.0))
         params = SweepParams(
+            printer_model=printer_model,
+            tool_index=raw_tool if is_indx(printer_model) else 0,
             K_values=tuple(float(k) for k in d["k_values"]),
             cycles_per_K=int(d["cycles_per_K"][0]),
             slow_half_s=float(d["slow_half_s"][0]),

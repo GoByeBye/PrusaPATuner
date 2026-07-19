@@ -33,7 +33,7 @@
 <body>
   <header>
     <h1>Prusa PA Tuner</h1>
-    <span class="subtitle">Auto-tune Linear Advance on the Core One via the nozzle loadcell.</span>
+    <span class="subtitle">Auto-tune Pressure Advance on the Core One and eight-tool INDX via the nozzle loadcell.</span>
   </header>
 
   <main>
@@ -47,9 +47,31 @@
     <section class="card">
       <h2>1. Printer</h2>
       <div class="row">
+        <label>Machine
+          <select id="printer_model">
+            <option value="COREONE">CORE One</option>
+            <option value="COREONEINDX">CORE One INDX</option>
+          </select>
+        </label>
+        <label id="tool_index_wrap">Mapped INDX tool
+          <select id="tool_index">
+            <option value="0">Tool 1 (T0)</option>
+            <option value="1">Tool 2 (T1)</option>
+            <option value="2">Tool 3 (T2)</option>
+            <option value="3">Tool 4 (T3)</option>
+            <option value="4">Tool 5 (T4)</option>
+            <option value="5">Tool 6 (T5)</option>
+            <option value="6">Tool 7 (T6)</option>
+            <option value="7">Tool 8 (T7)</option>
+          </select>
+        </label>
         <label>Host / IP <input id="printer_host" placeholder="192.168.1.42" /></label>
         <label>User <input id="printer_user" value="maker" /></label>
         <label>PrusaLink password <input id="printer_password" type="password" placeholder="Core One — Settings → Network → PrusaLink" /></label>
+      </div>
+      <div id="indx_tool_hint" class="meta" hidden>
+        Each run calibrates one mapped G-code tool. Choose T0–T7 explicitly;
+        run separate tests for tools that use different filament or temperatures.
       </div>
       <div class="row">
         <label class="wide">Legacy API key (older Buddy only — leave blank if using password)
@@ -728,6 +750,6 @@
     </section>
   </main>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=20260719-midprint-open"></script>
 </body>
 </html>
